@@ -684,7 +684,8 @@ bot.onText(/^(?:\/fund|fund)(?:\s+(.+))?$/i, async (msg, match) => {
     await bot.sendMessage(msg.chat.id, '❌ Only full-access users (John, Bukunmi) can fund wallets.');
     return;
   }
-  const args = (match[1] || '').trim();
+  const args = msg.text.trim();  // CEO directive 8 May 2026 - use full
+  // message; the trigger regex's lazy match was swallowing tokens like "5GB".
   if (!args || /^help$/i.test(args)) {
     await bot.sendMessage(
       msg.chat.id,
@@ -976,7 +977,8 @@ bot.onText(/^(?:\/buydata|(?:buy|data)\b.*?(?:\bdata\b|\b\d+(?:\.\d+)?\s*(?:GB|M
   const sender = _findUserByTelegramId(msg.from?.id);
   if (!sender) return bot.sendMessage(msg.chat.id, 'You must /start first.');
   if (sender.permission !== 'full') return bot.sendMessage(msg.chat.id, 'Only full-access users (John, Bukunmi) can buy via the bot.');
-  const args = (match[1] || '').trim();
+  const args = msg.text.trim();  // CEO directive 8 May 2026 - use full
+  // message; the trigger regex's lazy match was swallowing tokens like "5GB".
   if (!args || /^help$/i.test(args)) {
     return bot.sendMessage(msg.chat.id,
       'Buy data examples:\n' +
@@ -1051,7 +1053,8 @@ bot.onText(/^(?:\/buyelectricity|(?:buy|electricity)\b.*?\belectricity\b|electri
   const sender = _findUserByTelegramId(msg.from?.id);
   if (!sender) return bot.sendMessage(msg.chat.id, 'You must /start first.');
   if (sender.permission !== 'full') return bot.sendMessage(msg.chat.id, 'Only full-access users (John, Bukunmi) can buy via the bot.');
-  const args = (match[1] || '').trim();
+  const args = msg.text.trim();  // CEO directive 8 May 2026 - use full
+  // message; the trigger regex's lazy match was swallowing tokens like "5GB".
   if (!args || /^help$/i.test(args)) {
     return bot.sendMessage(msg.chat.id,
       'Buy electricity:\n' +
@@ -1089,7 +1092,8 @@ bot.onText(/^(?:\/buycable|(?:buy|cable)\b.*?\bcable\b|cable\b.*)(?:\s+(.+))?$/i
   const sender = _findUserByTelegramId(msg.from?.id);
   if (!sender) return bot.sendMessage(msg.chat.id, 'You must /start first.');
   if (sender.permission !== 'full') return bot.sendMessage(msg.chat.id, 'Only full-access users (John, Bukunmi) can buy via the bot.');
-  const args = (match[1] || '').trim();
+  const args = msg.text.trim();  // CEO directive 8 May 2026 - use full
+  // message; the trigger regex's lazy match was swallowing tokens like "5GB".
   if (!args || /^help$/i.test(args)) {
     return bot.sendMessage(msg.chat.id,
       'Buy cable:\n' +
