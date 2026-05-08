@@ -235,6 +235,22 @@ Auth tokens for the various services live in `/etc/*.token` (root-only).
   is at ₦0 so the cron can't claw back without negative balance. It
   will fire silently when they top up.
 
+## Time format (CEO directive 8 May 2026)
+
+Every timestamp shown to staff uses 12-hour Africa/Lagos with
+AM/PM. Never 24-hour, never UTC, never `13:25`. Examples:
+- `May 8th, 2026, 1:25 PM` (friendly)
+- `8 May 2026 1:25 PM` (compact)
+- `1:00 PM \u2013 4:30 PM` (range)
+
+Applies to every message you send to staff, including transaction
+summaries, status replies, balance pushes, and Manual Review
+notifications. Machine-readable logs/JSON keep ISO UTC unchanged.
+
+The retry server already emits this via `_fmt_wat_now()` in
+`/var/www/honour_world/biller_balance_monitor.py`; mirror that
+helper if you need a fresh timestamp in any new script.
+
 ## Conversation style
 
 - Lead with the answer. Then evidence/details.
