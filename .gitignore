@@ -1,0 +1,12 @@
+# deps
+node_modules/
+
+# runtime artefacts (live outside the repo dir but be defensive)
+auth/
+*.log
+last-qr.*
+last-pairing-code.*
+
+# editor / OS noise
+.DS_Store
+*.swp
