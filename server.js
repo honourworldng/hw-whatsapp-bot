@@ -73,6 +73,169 @@ const HWBOT_HOME = process.env.HW_WA_HWBOT_HOME || "/home/hwbot";
 // side correctly attribute every credit/debit to the human who
 // authorised it. Every action requires explicit chat confirmation.
 const HW_API_BASE = process.env.HW_API_BASE || 'https://api.honourworld.com';
+const HW_RETRY_CONFIG_PATH = '/var/www/honour_world/config.json';
+const JWT_REFRESH_THRESHOLD_HOURS = 48;
+
+function _readAdminCreds() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(HW_RETRY_CONFIG_PATH, 'utf8'));
+    return { email: cfg.admin_email || '', password: cfg.admin_password || '' };
+  } catch (_) {
+    return { email: '', password: '' };
+  }
+}
+
+function _b64urlDecode(str) {
+  let s = String(str).replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return Buffer.from(s, 'base64');
+}
+
+function _decodeJwtExp(jwt) {
+  if (!jwt || typeof jwt !== 'string') return null;
+  const parts = jwt.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const payload = JSON.parse(_b64urlDecode(parts[1]).toString('utf8'));
+    return typeof payload.exp === 'number' ? payload.exp : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function _hoursUntilExpiry(jwt) {
+  const exp = _decodeJwtExp(jwt);
+  if (!exp) return null;
+  return (exp - Math.floor(Date.now() / 1000)) / 3600;
+}
+
+// RFC 6238 TOTP (SHA-1, 30s step, 6 digits) — matches Python's pyotp.
+function _generateTotp(secretBase32) {
+  if (!secretBase32) throw new Error('TOTP secret missing');
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = '';
+  const clean = String(secretBase32).toUpperCase().replace(/[^A-Z2-7]/g, '');
+  for (const c of clean) {
+    const idx = alphabet.indexOf(c);
+    if (idx === -1) continue;
+    bits += idx.toString(2).padStart(5, '0');
+  }
+  const bytes = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    bytes.push(parseInt(bits.slice(i, i + 8), 2));
+  }
+  const key = Buffer.from(bytes);
+  let t = Math.floor(Date.now() / 1000 / 30);
+  const buf = Buffer.alloc(8);
+  for (let i = 7; i >= 0; i--) { buf[i] = t & 0xff; t = Math.floor(t / 256); }
+  const hmac = crypto.createHmac('sha1', key).update(buf).digest();
+  const offset = hmac[hmac.length - 1] & 0xf;
+  const code = ((hmac[offset] & 0x7f) << 24) |
+               ((hmac[offset + 1] & 0xff) << 16) |
+               ((hmac[offset + 2] & 0xff) << 8) |
+               (hmac[offset + 3] & 0xff);
+  return String(code % 1000000).padStart(6, '0');
+}
+
+async function _loginAsAdmin() {
+  const { email, password } = _readAdminCreds();
+  if (!email || !password) {
+    throw new Error('admin_email / admin_password missing from config.json');
+  }
+  const r1 = await fetch(`${HW_API_BASE}/api/v2/user/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'frontend-source': 'admin' },
+    body: JSON.stringify({ email, password }),
+  });
+  const d1 = await r1.json().catch(() => ({}));
+  const preToken = d1?.token;
+  const twofaSecret = d1?.data?.is2FASecret;
+  if (!preToken) throw new Error(`login step 1 failed (${r1.status}): ${JSON.stringify(d1).slice(0, 180)}`);
+  if (!twofaSecret) throw new Error('login step 1 returned no 2FA secret');
+  const otp = _generateTotp(twofaSecret);
+  const r2 = await fetch(`${HW_API_BASE}/api/v2/user/is2fa-authenticate`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      'frontend-source': 'admin',
+      'Authorization': preToken,
+    },
+    body: JSON.stringify({ token: otp }),
+  });
+  const d2 = await r2.json().catch(() => ({}));
+  if (!d2?.token) throw new Error(`login step 2 (2FA) failed (${r2.status}): ${JSON.stringify(d2).slice(0, 180)}`);
+  return d2.token;
+}
+
+// Returns a healthy JWT for the given phone, refreshing via 2FA login when:
+//   - no JWT is stored, OR
+//   - the stored JWT has less than JWT_REFRESH_THRESHOLD_HOURS of runway, OR
+//   - the stored JWT has already expired.
+// On refresh, the new JWT is saved under the same phone so subsequent
+// lookups are fast. Throws if refresh itself fails (caller decides UX).
+async function _getValidJwt(phone) {
+  const stored = _getJwtForPhone(phone);
+  const hoursLeft = stored ? _hoursUntilExpiry(stored) : null;
+  if (stored && hoursLeft !== null && hoursLeft > JWT_REFRESH_THRESHOLD_HOURS) {
+    return stored;
+  }
+  console.log(`[hw-tg-bot] JWT auto-refresh for ${phone} (hoursLeft=${hoursLeft})`);
+  const fresh = await _loginAsAdmin();
+  const tokens = _loadAdminTokens();
+  tokens[phone] = {
+    jwt: fresh,
+    savedAt: Date.now(),
+    lastValidatedAt: Date.now(),
+    autoRefreshed: true,
+  };
+  _saveAdminTokens(tokens);
+  return fresh;
+}
+
+// Authed fetch with one-shot refresh-on-401/403. Use this for every
+// admin-scoped HW API call so callers do not need to know about JWT
+// lifetime. Caller passes phone (the sender's phone in the bot's user
+// table) so we can refresh the right user's session.
+async function _apiFetch(phone, url, options = {}) {
+  let jwt;
+  try {
+    jwt = await _getValidJwt(phone);
+  } catch (e) {
+    console.warn(`[hw-tg-bot] _getValidJwt failed: ${e.message}`);
+    // Fall back to whatever's stored; some older JWTs may still work.
+    jwt = _getJwtForPhone(phone);
+  }
+  if (!jwt) {
+    throw new Error('No admin JWT available — run /setadmin <jwt> or check config.json admin creds');
+  }
+  const headers = {
+    ...(options.headers || {}),
+    'Authorization': jwt,
+    'frontend-source': 'admin',
+  };
+  let resp = await fetch(url, { ...options, headers });
+  if (resp.status === 401 || resp.status === 403) {
+    try {
+      const fresh = await _loginAsAdmin();
+      const tokens = _loadAdminTokens();
+      tokens[phone] = {
+        jwt: fresh,
+        savedAt: Date.now(),
+        lastValidatedAt: Date.now(),
+        autoRefreshed: true,
+      };
+      _saveAdminTokens(tokens);
+      console.log(`[hw-tg-bot] JWT auto-refresh on ${resp.status} (${phone})`);
+      const headers2 = { ...headers, Authorization: fresh };
+      resp = await fetch(url, { ...options, headers: headers2 });
+    } catch (e) {
+      console.warn(`[hw-tg-bot] refresh-on-${resp.status} failed: ${e.message}`);
+    }
+  }
+  return resp;
+}
+
+
 const ADMIN_TOKENS_PATH = process.env.HW_TG_ADMIN_TOKENS || '/var/lib/hw-whatsapp-bot/admin-tokens.json';
 const FUND_CONFIRM_WINDOW_MS = Number(process.env.HW_TG_FUND_WINDOW_MS || 60000);
 
@@ -818,6 +981,129 @@ bot.onText(/^\/myadmin\b/i, async (msg) => {
 });
 
 // ── /fund <user> <type> <amount> [purpose: ...] — propose a credit ────
+function _parseFundArgs(rawArgs) {
+  if (!rawArgs || typeof rawArgs !== 'string') return null;
+
+  // Strip leading "/fund" or "fund " verb so the rest is just args.
+  let s = rawArgs.replace(/^\s*\/?fund\b/i, '').trim();
+  if (!s) return null;
+
+  // 1. Pull purpose out FIRST so its words do not interfere.
+  let purpose = '';
+  const purposeMatch = s.match(/\b(?:purpose|reason|note)\s*[:\-]\s*(.+)$/i);
+  if (purposeMatch) {
+    purpose = purposeMatch[1].trim();
+    s = s.slice(0, purposeMatch.index).trim();
+  }
+
+  // 2. AMOUNT — priority order.
+  //    a. Currency-marked: ₦3,000 / N3,000 / N 3000.50 / N3000
+  //    b. After "with ", "of ", "for ", "to ": "with 3000"
+  //    c. Last numeric token (fallback)
+  let amount = NaN;
+  let amountSpan = null;
+
+  const tryRe = (re) => {
+    const m = re.exec(s);
+    if (!m) return false;
+    const numStr = String(m[1]).replace(/[,\s]/g, '');
+    const v = Number(numStr);
+    if (Number.isFinite(v) && v > 0) {
+      amount = v;
+      amountSpan = [m.index, m.index + m[0].length];
+      return true;
+    }
+    return false;
+  };
+
+  // a) currency-marked
+  tryRe(/(?:₦|\bN)\s*([0-9]{1,3}(?:[,\s][0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\b/i)
+    // b) "with/of/for X"
+    || tryRe(/\b(?:with|of|for|amount[:\s]*)\s+([0-9]{1,3}(?:[,\s][0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\b/i)
+    // c) last number with comma format (likely an amount)
+    || tryRe(/\b([0-9]{1,3}(?:[,][0-9]{3})+(?:\.[0-9]+)?)\b/);
+
+  // d) fallback: small numeric (< 8 digits) is more likely amount than
+  // wallet/phone (those are 8-11 digits).
+  if (!Number.isFinite(amount)) {
+    const tokens = [...s.matchAll(/\b([0-9]+(?:\.[0-9]+)?)\b/g)];
+    for (const m of tokens) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > 0 && m[1].length <= 7) {
+        amount = n;
+        amountSpan = [m.index, m.index + m[0].length];
+        break;
+      }
+    }
+  }
+
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  // Strip the amount span from s so target detection cannot pick it.
+  let sNoAmount = s;
+  if (amountSpan) {
+    sNoAmount = (s.slice(0, amountSpan[0]) + ' ' + s.slice(amountSpan[1])).replace(/\s+/g, ' ').trim();
+  }
+
+  // 3. TARGET — priority: email > phone > wallet-id digits.
+  let target = null;
+  let type = null;
+
+  const emailM = sNoAmount.match(/\b(\S+@\S+\.\S+)\b/);
+  if (emailM) {
+    target = emailM[1];
+    type = 'email';
+  }
+
+  if (!target) {
+    const phoneM = sNoAmount.match(/\b((?:\+?234|0)\d{9,11})\b/);
+    if (phoneM) {
+      target = phoneM[1];
+      // type set below by keyword inference
+    }
+  }
+
+  if (!target) {
+    // Look for a 6-12 digit numeric token that's not the amount.
+    const numM = sNoAmount.match(/\b(\d{6,12})\b/);
+    if (numM) {
+      target = numM[1];
+    }
+  }
+
+  if (!target) return null;
+
+  // 4. TYPE — explicit keyword wins, then inferred from target shape.
+  if (!type) {
+    if (/\b(?:wallet[\s-]*id|wallet)\b/i.test(rawArgs)) type = 'wallet';
+    else if (/\bemail\b/i.test(rawArgs)) type = 'email';
+    else if (/\b(?:telephone|tel|phone|mobile|cell|number|line)\b/i.test(rawArgs)) type = 'telephone';
+    else {
+      // Infer from target shape.
+      if (/^\S+@\S+\.\S+$/.test(target)) type = 'email';
+      else if (/^(?:\+?234|0)\d{9,11}$/.test(target)) type = 'telephone';
+      else type = 'wallet';
+    }
+  }
+
+  // 5. Final shape sanity. If user explicitly said "wallet" but target
+  // looks like a phone (leading 0), trust the keyword and accept it.
+  if (type === 'email' && !/@/.test(target)) return null;
+  if (type === 'telephone' && !/^(?:\+?234|0)\d{9,11}$/.test(target)) {
+    // Fall back to wallet if it is at least a numeric id.
+    if (/^\d{4,12}$/.test(target)) type = 'wallet';
+    else return null;
+  }
+  if (type === 'wallet' && !/^\d{4,12}$/.test(target)) {
+    if (/^\S+@\S+\.\S+$/.test(target)) type = 'email';
+    else if (/^(?:\+?234|0)\d{9,11}$/.test(target)) type = 'telephone';
+    else return null;
+  }
+
+  return { target, type, amount, purpose };
+}
+
+
 bot.onText(/^(?:\/fund|fund)(?:\s+(.+))?$/i, async (msg, match) => {
   if (msg.chat.type !== 'private') return;
   // Avoid clashing with /fundcancel — that has its own handler below
@@ -849,16 +1135,15 @@ bot.onText(/^(?:\/fund|fund)(?:\s+(.+))?$/i, async (msg, match) => {
     );
     return;
   }
-  const re = /^(\S+)\s+(wallet|email|telephone)\s+([0-9]+(?:\.[0-9]+)?)\s*(?:purpose:\s*(.+))?$/i;
-  const m2 = args.match(re);
-  if (!m2) {
+  const parsed = _parseFundArgs(args);
+  if (!parsed) {
     await bot.sendMessage(msg.chat.id, '❌ Could not parse arguments. Try `/fund help`.', { parse_mode: 'Markdown' });
     return;
   }
-  const target = m2[1];
-  const type = m2[2];
-  const amountStr = m2[3];
-  const purposeRaw = m2[4];
+  const target = parsed.target;
+  const type = parsed.type;
+  const amountStr = String(parsed.amount);
+  const purposeRaw = parsed.purpose;
   const amount = Number(amountStr);
   if (!Number.isFinite(amount) || amount <= 0) {
     await bot.sendMessage(msg.chat.id, '❌ Invalid amount.');
