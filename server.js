@@ -714,10 +714,20 @@ async function _dispatch(m) {
       phone = mapped;
     } else {
       const pushName = (m.pushName || '').toLowerCase();
+      // CEO directive 9 May 2026 — match nicknames too. WhatsApp profile
+      // names are personal (e.g. "Buks_love" for Bukunmi). Without a
+      // nickname map the fuzzy match would drop these as unknown.
+      const NICKNAMES = {
+        'bukunmi': ['buks', 'bj', 'bjt'],
+        'oluwaseun': ['seun', 'shawn'],
+        'ayomide': ['ayo'],
+      };
       if (pushName) {
         for (const candidate of _BY_PHONE.values()) {
           const first = (candidate.name || '').split(' ')[0].toLowerCase();
-          if (first && pushName.includes(first)) {
+          const aliases = [first, ...(NICKNAMES[first] || [])].filter(Boolean);
+          const hit = aliases.some(a => pushName.includes(a));
+          if (hit) {
             u = candidate;
             phone = candidate.phone;
             // Learn the mapping so we don't fuzzy-match every message.
