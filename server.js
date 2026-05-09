@@ -291,6 +291,22 @@ console.log(`[hw-whatsapp-bot] /send bearer ${SHARED_TOKEN ? 'configured' : 'not
 // ── Persisted user DB ───────────────────────────────────────────────
 fs.mkdirSync('/var/lib/hw-whatsapp-bot', { recursive: true });
 
+const LID_MAP_PATH = process.env.HW_WA_LID_MAP || '/var/lib/hw-whatsapp-bot/wa-lid-map.json';
+
+function _loadLidMap() {
+  try {
+    return JSON.parse(fs.readFileSync(LID_MAP_PATH, 'utf8'));
+  } catch (_) {
+    return {};
+  }
+}
+
+function _saveLidMap(map) {
+  try {
+    fs.writeFileSync(LID_MAP_PATH, JSON.stringify(map, null, 2), { mode: 0o640 });
+  } catch (_) {}
+}
+
 function _loadUsers() {
   try {
     return JSON.parse(fs.readFileSync(USERS_DB_PATH, 'utf8'));
@@ -514,9 +530,48 @@ async function _dispatch(m) {
   // groups are dropped silently to keep WhatsApp anti-spam happy.
   if (!m.message || m.key?.fromMe) return;
   const jid = m.key?.remoteJid;
-  if (!jid?.endsWith('@s.whatsapp.net')) return; // ignore groups/status
-  const phone = _phoneFromJid(jid);
-  const u = _BY_PHONE.get(phone) || null;
+  if (!jid) return;
+  // CEO directive 9 May 2026 — accept @lid (linked-device) JIDs in
+  // addition to @s.whatsapp.net. Multi-device WhatsApp accounts (the
+  // COO and Seun) route through @lid and were silently dropped before.
+  // Reject only group/broadcast/newsletter chats.
+  if (jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
+  if (!jid.endsWith('@s.whatsapp.net') && !jid.endsWith('@lid')) return;
+  let phone = _phoneFromJid(jid);
+  let u = _BY_PHONE.get(phone) || null;
+  // For @lid the JID prefix is the linked-device id, not the phone, so
+  // _BY_PHONE will miss. Fall back to (a) a persisted @lid→phone map,
+  // then (b) fuzzy-match m.pushName against known staff first names.
+  if (!u && jid.endsWith('@lid')) {
+    const lidMap = _loadLidMap();
+    const mapped = lidMap[jid];
+    if (mapped) {
+      u = _BY_PHONE.get(mapped) || null;
+      phone = mapped;
+    } else {
+      const pushName = (m.pushName || '').toLowerCase();
+      if (pushName) {
+        for (const candidate of _BY_PHONE.values()) {
+          const first = (candidate.name || '').split(' ')[0].toLowerCase();
+          if (first && pushName.includes(first)) {
+            u = candidate;
+            phone = candidate.phone;
+            // Learn the mapping so we don't fuzzy-match every message.
+            try {
+              lidMap[jid] = candidate.phone;
+              _saveLidMap(lidMap);
+              log.info({ jid, phone: candidate.phone, name: candidate.name, pushName: m.pushName }, 'learned @lid → staff mapping');
+            } catch (e) { log.warn({ err: e?.message }, 'lid map save failed'); }
+            break;
+          }
+        }
+      }
+    }
+  }
+  if (!u) {
+    try { log.info({ jid, pushName: m.pushName, type: jid.endsWith('@lid') ? 'lid-unknown' : 'phone-unknown' }, 'inbound dropped — sender not on staff whitelist'); } catch (_) {}
+    return;
+  }
   const text = m.message.conversation
     || m.message.extendedTextMessage?.text
     || m.message.imageMessage?.caption
