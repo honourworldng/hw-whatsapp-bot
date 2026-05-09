@@ -1568,7 +1568,21 @@ app.post('/send', async (req, res) => {
   const toStr = String(to).trim();
   if (toStr === 'all' || toStr === 'all-full' || toStr === 'all-readonly') {
     const filt = toStr === 'all' ? null : toStr === 'all-full' ? 'full' : 'readonly';
-    recipients = Object.values(db).filter((u) => !filt || u.permission === filt);
+    const all = Object.values(db).filter((u) => !filt || u.permission === filt);
+    // CEO directive 9 May 2026 — dedupe recipients by phone (or jid).
+    // The user db keys some entries twice (bare phone + JID-suffixed)
+    // so Object.values returned the same person twice and the loop
+    // below sent the same alert twice on WhatsApp. The 60s send-dedup
+    // at the top of /send only fires for repeated /send calls, not
+    // for internal recipient duplication.
+    const seen = new Set();
+    recipients = [];
+    for (const u of all) {
+      const key = String(u.phone || u.jid || u.chatId || '');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      recipients.push(u);
+    }
   } else if (toStr.startsWith('tg:')) {
     // Explicit chat_id form: "tg:896318801"
     const id = parseInt(toStr.slice(3), 10);
