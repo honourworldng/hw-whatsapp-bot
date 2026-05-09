@@ -238,6 +238,42 @@ const READONLY_SYSTEM_PROMPT = (
   'send an email alert. Then continue your normal response.'
 );
 
+
+// Send deduplication (CEO directive 9 May 2026).
+// Same (to + message + image) within DEDUP_WINDOW_MS is treated as a
+// duplicate and skipped without re-sending. Map stays bounded by a
+// periodic sweep.
+const _sendDedupMap = new Map();
+const SEND_DEDUP_WINDOW_MS = 60 * 1000;
+
+function _sendDedupKey(payload) {
+  const h = crypto.createHash('sha256');
+  h.update(String(payload?.to || ''));
+  h.update('\x1e');
+  h.update(String(payload?.message || ''));
+  h.update('\x1e');
+  h.update(String(payload?.image || ''));
+  return h.digest('hex');
+}
+
+function _isDuplicateSend(payload) {
+  const key = _sendDedupKey(payload);
+  const now = Date.now();
+  const prev = _sendDedupMap.get(key);
+  if (prev && (now - prev) < SEND_DEDUP_WINDOW_MS) {
+    return { duplicate: true, ageMs: now - prev };
+  }
+  _sendDedupMap.set(key, now);
+  return { duplicate: false };
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - SEND_DEDUP_WINDOW_MS * 2;
+  for (const [k, ts] of _sendDedupMap) {
+    if (ts < cutoff) _sendDedupMap.delete(k);
+  }
+}, SEND_DEDUP_WINDOW_MS).unref();
+
 // ── Load tokens ─────────────────────────────────────────────────────
 let SHARED_TOKEN = null;
 try {
@@ -321,7 +357,24 @@ function _newSessionId(user) {
 
 function _findUserByTelegramId(telegramId) {
   const db = _loadUsers();
-  return db[String(telegramId)] || null;
+  const direct = db[String(telegramId)] || null;
+  if (direct) return direct;
+  // CEO directive 8 May 2026 — WhatsApp JID fallback. The Baileys shim
+  // sets msg.from.id to a JID like "2348168867154@s.whatsapp.net".
+  // Resolve the phone and look it up against the static whitelist.
+  const id = String(telegramId || '');
+  const phoneFromJid = id.includes('@') ? id.split('@')[0].replace(/\D/g, '') : id.replace(/\D/g, '');
+  if (!phoneFromJid) return null;
+  const staticUser = _BY_PHONE.get(phoneFromJid);
+  if (!staticUser) return null;
+  // Synthesise a DB-shaped record so callers get the same fields they expect.
+  return {
+    telegramId: id,
+    name: staticUser.name,
+    phone: staticUser.phone,
+    permission: staticUser.permission,
+    jid: id.includes('@') ? id : `${phoneFromJid}@s.whatsapp.net`,
+  };
 }
 
 // Markdown-escape for Telegram's MarkdownV2 (we use 'Markdown' parse_mode
@@ -444,6 +497,7 @@ async function _connectWhatsApp() {
     }
   });
   _sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    log.info({ type, count: messages?.length, fromMe: messages?.[0]?.key?.fromMe, jid: messages?.[0]?.key?.remoteJid }, 'messages.upsert');
     if (type !== 'notify') return;
     for (const m of messages) {
       try { await _dispatch(m); }
@@ -453,6 +507,15 @@ async function _connectWhatsApp() {
 }
 
 async function _dispatch(m) {
+  // CEO directive 8 May 2026 — WhatsApp bot is a one-way notifications
+  // channel only. Every incoming message is dropped silently (no reply,
+  // no Claude subprocess, no command parsing) for the CEO, COO, and
+  // every read-only staff member. Outbound /send stays fully wired.
+  if (!m.message || m.key?.fromMe) return;
+  // Log only, then exit.
+  try { log.info({ jid: m.key?.remoteJid }, "inbound dropped (one-way mode)"); } catch (_) {}
+  return;
+  // ---- everything below is unreachable on purpose ----
   if (!m.message || m.key?.fromMe) return;
   const jid = m.key?.remoteJid;
   if (!jid?.endsWith('@s.whatsapp.net')) return; // ignore groups/status
@@ -467,6 +530,36 @@ async function _dispatch(m) {
   // button, so synthesise the contact event when /start arrives from
   // a whitelisted phone — same effect as the Telegram "share contact"
   // button without the extra round trip.
+  // Auto-register whitelisted user into the persisted JSON DB on first
+  // contact (CEO directive 8 May 2026). Without this, the /send lookup
+  // returns 404 "no registered user" and the COO cannot ship outbound
+  // alerts to WhatsApp by phone, and the /c handler bounces every reply
+  // with "you must /start first".
+  if (u) {
+    try {
+      const db = _loadUsers();
+      if (!db[jid]) {
+        db[jid] = {
+          telegramId: jid,
+          name: u.name,
+          phone: u.phone,
+          permission: u.permission,
+          jid,
+          firstSeen: new Date().toISOString(),
+        };
+        // Mirror the entry under the bare phone too so the /send branch
+        // that resolves "to: 2348168867154" hits a record without a
+        // separate phoneToTelegramId index.
+        db[u.phone] = db[jid];
+        _saveUsers(db);
+        log.info({ phone: u.phone, name: u.name }, 'auto-registered WhatsApp user on first contact');
+      } else if (db[jid].jid !== jid) {
+        db[jid].jid = jid;
+        db[u.phone] = db[jid];
+        _saveUsers(db);
+      }
+    } catch (e) { log.warn({ err: e?.message }, 'auto-register failed'); }
+  }
   let synth_contact = null;
   if (/^\/start\b/i.test(text || '') && u) {
     synth_contact = { phone_number: u.phone, first_name: u.name.split(' ')[0] };
@@ -1451,6 +1544,13 @@ app.get('/healthz', (_req, res) => {
 });
 
 app.post('/send', async (req, res) => {
+  // Dedup guard — skip identical (to + message + image) within last 60s.
+  const dedup = _isDuplicateSend(req.body || {});
+  if (dedup.duplicate) {
+    console.log(`[bot-send] dedup skip — same payload sent ${dedup.ageMs}ms ago`);
+    return res.json({ ok: true, deduplicated: true, ageMs: dedup.ageMs });
+  }
+
   // CEO directive 8 May 2026 — accept an optional `image` field (URL) so
   // alerts (e.g. SIM-airtime low-balance per network) can ship the network
   // logo as a Telegram photo with the body as caption. When `image` is
@@ -1505,22 +1605,22 @@ app.post('/send', async (req, res) => {
         // with the full text in a separate message.
         const msgStr = String(message);
         if (msgStr.length <= TG_CAPTION_MAX) {
-          sent = await bot.sendPhoto(r.chatId, image, {
+          sent = await bot.sendPhoto((r.jid || r.chatId || r.phone), image, {
             caption: msgStr,
             parse_mode: 'Markdown',
           });
         } else {
-          await bot.sendPhoto(r.chatId, image);
-          sent = await bot.sendMessage(r.chatId, msgStr, { parse_mode: 'Markdown' });
+          await bot.sendPhoto((r.jid || r.chatId || r.phone), image);
+          sent = await bot.sendMessage((r.jid || r.chatId || r.phone), msgStr, { parse_mode: 'Markdown' });
         }
       } else {
-        sent = await bot.sendMessage(r.chatId, String(message), { parse_mode: 'Markdown' });
+        sent = await bot.sendMessage((r.jid || r.chatId || r.phone), String(message), { parse_mode: 'Markdown' });
       }
       results.push({ ok: true, name: r.name, msgId: sent.message_id });
     } catch (e) {
       // Markdown parse failure or photo URL fetch failure → retry plain text
       try {
-        const sent = await bot.sendMessage(r.chatId, String(message));
+        const sent = await bot.sendMessage((r.jid || r.chatId || r.phone), String(message));
         results.push({ ok: true, name: r.name, msgId: sent.message_id, plain: true });
       } catch (e2) {
         results.push({ ok: false, name: r.name, error: e2?.message || 'send failed' });
