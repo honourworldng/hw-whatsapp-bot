@@ -507,15 +507,11 @@ async function _connectWhatsApp() {
 }
 
 async function _dispatch(m) {
-  // CEO directive 8 May 2026 — WhatsApp bot is a one-way notifications
-  // channel only. Every incoming message is dropped silently (no reply,
-  // no Claude subprocess, no command parsing) for the CEO, COO, and
-  // every read-only staff member. Outbound /send stays fully wired.
-  if (!m.message || m.key?.fromMe) return;
-  // Log only, then exit.
-  try { log.info({ jid: m.key?.remoteJid }, "inbound dropped (one-way mode)"); } catch (_) {}
-  return;
-  // ---- everything below is unreachable on purpose ----
+  // CEO directive 9 May 2026 — inbound enabled. WhatsApp bot now mirrors
+  // the Telegram bot's command parser and free-text Claude pass-through
+  // for registered staff. Replies go only to whitelisted users (full =
+  // John, readonly = Bukunmi/Seun/Mary/Ayomide); unknown senders and
+  // groups are dropped silently to keep WhatsApp anti-spam happy.
   if (!m.message || m.key?.fromMe) return;
   const jid = m.key?.remoteJid;
   if (!jid?.endsWith('@s.whatsapp.net')) return; // ignore groups/status
@@ -538,24 +534,21 @@ async function _dispatch(m) {
   if (u) {
     try {
       const db = _loadUsers();
-      if (!db[jid]) {
-        db[jid] = {
-          telegramId: jid,
+      // CEO directive 9 May 2026 — only key by bare phone (canonical).
+      // The earlier dual-key (phone + JID-suffixed) caused Object.values
+      // duplicates which broadcast each alert twice on WhatsApp.
+      if (!db[u.phone]) {
+        db[u.phone] = {
           name: u.name,
           phone: u.phone,
           permission: u.permission,
           jid,
           firstSeen: new Date().toISOString(),
         };
-        // Mirror the entry under the bare phone too so the /send branch
-        // that resolves "to: 2348168867154" hits a record without a
-        // separate phoneToTelegramId index.
-        db[u.phone] = db[jid];
         _saveUsers(db);
         log.info({ phone: u.phone, name: u.name }, 'auto-registered WhatsApp user on first contact');
-      } else if (db[jid].jid !== jid) {
-        db[jid].jid = jid;
-        db[u.phone] = db[jid];
+      } else if (db[u.phone].jid !== jid) {
+        db[u.phone].jid = jid;
         _saveUsers(db);
       }
     } catch (e) { log.warn({ err: e?.message }, 'auto-register failed'); }
