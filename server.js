@@ -158,7 +158,7 @@ function _deregisterInflight(id) { _INFLIGHT.delete(id); }
 // The COO and read-only staff use the Telegram bot for write actions.
 const USERS = [
   { name: 'John Amoo',          phone: '2348168867154', permission: 'full'     },
-  { name: 'Bukunmi Amoo',       phone: '2347031095864', permission: 'readonly' },
+  { name: 'Bukunmi Amoo',       phone: '2347031095864', permission: 'full'     },
   { name: 'Oluwaseun Bamgbade', phone: '2348167993903', permission: 'readonly' },
   { name: 'Mary Adebiyi',       phone: '2349046707717', permission: 'readonly' },
   { name: 'Ayomide Oluwafemi',  phone: '2348031230718', permission: 'readonly' },
@@ -526,8 +526,9 @@ async function _dispatch(m) {
   // CEO directive 9 May 2026 — inbound enabled. WhatsApp bot now mirrors
   // the Telegram bot's command parser and free-text Claude pass-through
   // for registered staff. Replies go only to whitelisted users (full =
-  // John, readonly = Bukunmi/Seun/Mary/Ayomide); unknown senders and
-  // groups are dropped silently to keep WhatsApp anti-spam happy.
+  // John+Bukunmi (CEO+COO, husband and wife — directive 9 May 2026),
+  // readonly = Seun/Mary/Ayomide); unknown senders and groups are
+  // dropped silently to keep WhatsApp anti-spam happy.
   if (!m.message || m.key?.fromMe) return;
   const jid = m.key?.remoteJid;
   if (!jid) return;
