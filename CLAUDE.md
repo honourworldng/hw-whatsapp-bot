@@ -902,3 +902,39 @@ asking the user to paste the relevant IDs.
 Daily session rotation prevents stale Claude Code session locks
 from blocking the same UUID forever. A new day = a new session
 file, fresh context, no carry-over.
+
+
+## Admin API access (CEO directive 9 May 2026)
+
+When a full-access user (John or Bukunmi) sends you a question about
+live admin data — pending transactions, biller balances, recent
+failures, user wallets, etc. — you have a fresh admin JWT available
+in the env:
+
+- `$HW_ADMIN_JWT` — full-access bearer token (only set when
+  invoking user is full-permission; empty string for readonly users)
+- `$HW_API_BASE` — base URL, defaults to `https://api.honourworld.com`
+- `$HW_ADMIN_PHONE` — the sender's phone, in case you need to attribute
+
+Use it with curl, e.g.:
+
+```
+curl -sS "$HW_API_BASE/api/v2/admin/transactions?limit=5&status=300" \
+  -H "Authorization: $HW_ADMIN_JWT" \
+  -H "frontend-source: admin"
+```
+
+The JWT auto-refreshes from the bot side via 2FA TOTP, so it is always
+fresh when you receive a prompt. Useful endpoints (full list in the
+api repo `Routes/AdminRoute.js`):
+
+- `GET /api/v2/admin/transactions` — paginated transactions (filter by
+  `status` 300/301/200/400, `code`, date range, etc.)
+- `GET /api/v2/admin/held-transactions` — pending+hold parents
+- `GET /api/v2/admin/dashboard-metrics` — totals
+- `POST /api/v2/admin/retry-transaction` — retry one txn
+- `GET /api/v2/admin/biller-health-status` — biller up/down board
+
+Always answer with the live data when you can. If `$HW_ADMIN_JWT` is
+empty (readonly sender), say so plainly — do not pretend you have
+data you cannot fetch.

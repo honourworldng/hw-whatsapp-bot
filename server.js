@@ -290,6 +290,10 @@ function _saveAdminTokens(tokens) {
   }
   fs.writeFileSync(ADMIN_TOKENS_PATH, JSON.stringify(enc, null, 2), { mode: 0o600 });
 }
+// CEO directive 9 May 2026 — alias kept for the JWT auto-refresh
+// helpers ported from earlier (they reference _getJwtForPhone).
+function _getJwtForPhone(phone) { return _getAdminJwt(phone); }
+
 function _getAdminJwt(phone) {
   const tokens = _loadAdminTokens();
   return tokens[phone]?.jwt || null;
@@ -1704,6 +1708,22 @@ async function _processClaudePrompt(msg, prompt, user) {
     thinkingMsg = await bot.sendMessage(msg.chat.id, '🤔 _Working on it…_', { parse_mode: 'Markdown' });
   } catch (_) {}
 
+  // CEO directive 9 May 2026 — pre-warm a fresh admin JWT so Claude
+  // (running as hwbot in the subprocess) can answer admin-data
+  // questions like "how many pending transactions" by curling the
+  // honourworld-api admin endpoints with HW_ADMIN_JWT. Only full-
+  // permission users (John+Bukunmi) get the JWT; readonly users see
+  // the same env var unset so any admin tool call from Claude fails
+  // gracefully rather than acting under the wrong identity.
+  let _hwAdminJwt = '';
+  if (user.permission === 'full') {
+    try {
+      _hwAdminJwt = await _getValidJwt(user.phone);
+    } catch (e) {
+      console.warn(`[bot] JWT pre-warm failed for ${user.name}: ${e?.message}`);
+    }
+  }
+
   const sessionId = _newSessionId(user);
   // --dangerously-skip-permissions: in non-interactive `-p` mode there
   // is no human to approve each shell/edit/SSH; without this flag,
@@ -1743,6 +1763,9 @@ async function _processClaudePrompt(msg, prompt, user) {
           ...process.env,
           HOME: HWBOT_HOME,
           USER: 'hwbot',
+          HW_ADMIN_JWT: _hwAdminJwt || '',
+          HW_ADMIN_PHONE: user.phone || '',
+          HW_API_BASE: process.env.HW_API_BASE || 'https://api.honourworld.com',
           LOGNAME: 'hwbot',
           FORCE_COLOR: '0',
           NO_COLOR: '1',
