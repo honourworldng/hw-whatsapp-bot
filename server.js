@@ -612,10 +612,15 @@ async function _dispatch(m) {
   if (/^\/start\b/i.test(text || '') && u) {
     synth_contact = { phone_number: u.phone, first_name: u.name.split(' ')[0] };
   }
+  // CEO directive 9 May 2026 — set msg.from.id to phone-keyed JID
+  // (not the @lid we received) so _findUserByTelegramId resolves the
+  // staff record via _BY_PHONE. msg.chat.id stays as the original jid
+  // so the reply goes back through the same WhatsApp chat.
+  const fromId = (jid.endsWith('@lid') && phone) ? `${phone}@s.whatsapp.net` : jid;
   const msg = {
     message_id: m.key?.id,
     chat: { id: jid, type: 'private' },
-    from: { id: jid, first_name: (u?.name || '(unknown)').split(' ')[0], last_name: (u?.name || '').split(' ').slice(1).join(' ') },
+    from: { id: fromId, first_name: (u?.name || '(unknown)').split(' ')[0], last_name: (u?.name || '').split(' ').slice(1).join(' ') },
     text,
     contact: synth_contact,
     _phone: phone,
