@@ -48,6 +48,29 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 
+// ─────────────────────────────────────────────────────────────────────────
+// BOT_USAGE_LOG_10MAY2026 — per-user usage logger (COO directive 10 May 2026).
+// Appends one JSONL line per inbound message to /var/log/hw-bots/usage.log
+// so we can answer "is Mary/Seun/Ayomide actually using this bot?"
+// reliably without depending on journalctl retention windows.
+// Fields: ts, bot, user_name, phone, permission, command, text_preview, text_len.
+// ─────────────────────────────────────────────────────────────────────────
+const _USAGE_LOG_PATH = '/var/log/hw-bots/usage.log';
+function logUsage_BOT_USAGE_LOG_10MAY2026(fields) {
+  try {
+    const line = JSON.stringify({
+      ts: new Date().toISOString(),
+      bot: 'whatsapp',
+      ...fields,
+    }) + '\n';
+    fs.appendFileSync(_USAGE_LOG_PATH, line);
+  } catch (e) {
+    // never crash the bot on logger failure
+    try { console.error('usage logger failed:', e?.message); } catch (_) {}
+  }
+}
+
+
 const SHARED_TOKEN_FILE = process.env.HW_WA_TOKEN_FILE || '/etc/hw-whatsapp-bot.token';
 const HTTP_PORT = Number(process.env.HW_WA_HTTP_PORT || 9002);
 const USERS_DB_PATH = process.env.HW_WA_USERS_DB || '/var/lib/hw-whatsapp-bot/wa-users.json';
@@ -755,6 +778,19 @@ async function _dispatch(m) {
     || m.message.imageMessage?.caption
     || m.message.documentMessage?.caption
     || '';
+  // BOT_USAGE_LOG_10MAY2026 — log per-user usage before any handler runs
+  try {
+    const cmd = (text.trim().startsWith('/') ? text.trim().split(/\s+/)[0] : 'text');
+    logUsage_BOT_USAGE_LOG_10MAY2026({
+      user_name: u.name,
+      phone: u.phone,
+      permission: u.permission,
+      command: cmd,
+      text_preview: text.slice(0, 200),
+      text_len: text.length,
+    });
+  } catch (_) {}
+
   // Auto-share contact on /start: WhatsApp has no contact-share UX
   // button, so synthesise the contact event when /start arrives from
   // a whitelisted phone — same effect as the Telegram "share contact"
