@@ -99,6 +99,28 @@ const HW_API_BASE = process.env.HW_API_BASE || 'https://api.honourworld.com';
 const HW_RETRY_CONFIG_PATH = '/var/www/honour_world/config.json';
 const JWT_REFRESH_THRESHOLD_HOURS = 48;
 
+// HW_MONGO_URL_12MAY2026 (COO directive 12 May 2026 evening):
+// expose the mongo connection string to the claude spawn so the bot can
+// answer staff questions like "is there any pending transaction?"
+// without needing to read the root-owned config.json from inside the
+// hwbot-uid claude session. The node bot reads it once as root and
+// passes it through as MONGO_URL env on every claude spawn. Cached on
+// startup; if config.json is rotated, restart the bot.
+function _readHwMongoUrl() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(HW_RETRY_CONFIG_PATH, 'utf8'));
+    return cfg.mongo_url || cfg.MONGO_URL || cfg.mongoUrl || '';
+  } catch (_) {
+    return '';
+  }
+}
+const _HW_MONGO_URL = _readHwMongoUrl();
+if (_HW_MONGO_URL) {
+  console.log('[bot] MONGO_URL cached (length ' + _HW_MONGO_URL.length + ')');
+} else {
+  console.warn('[bot] could not read mongo_url from ' + HW_RETRY_CONFIG_PATH + ' — staff pending queries will fail');
+}
+
 function _readAdminCreds() {
   try {
     const cfg = JSON.parse(fs.readFileSync(HW_RETRY_CONFIG_PATH, 'utf8'));
@@ -657,7 +679,29 @@ const bot = {
   async sendPhoto(chatId, image, opts = {}) {
     if (!_sock || !_connected) throw new Error('WhatsApp socket not connected');
     const cap = opts?.caption ? _waSafe(opts.caption) : '';
-    const payload = { image: typeof image === 'string' ? { url: image } : image, caption: cap };
+    // WA_SENDPHOTO_LOCAL_PATH_11MAY2026 — accept local file paths in addition to http(s)
+    // URLs. Required for the PXES daily cron which screenshots the Mine
+    // page to disk on this same retry server and needs to attach it
+    // without a public HTTP endpoint. Baileys image field expects either
+    // Buffer or { url } where url must be http(s). For local paths we
+    // read the file into a Buffer here. Backward compatible — existing
+    // URL callers (network logos etc.) still hit the { url } branch.
+    let imgPayload;
+    if (typeof image === 'string') {
+      if (image.startsWith('http://') || image.startsWith('https://')) {
+        imgPayload = { url: image };
+      } else {
+        // Treat as local file path. Read into Buffer for Baileys.
+        try {
+          imgPayload = fs.readFileSync(image);
+        } catch (e) {
+          throw new Error(`sendPhoto local-file read failed for "${image}": ${e.message}`);
+        }
+      }
+    } else {
+      imgPayload = image;
+    }
+    const payload = { image: imgPayload, caption: cap };
     const r = await _sock.sendMessage(_toJid(chatId), payload);
     return { message_id: r?.key?.id };
   },
@@ -1802,6 +1846,8 @@ async function _processClaudePrompt(msg, prompt, user) {
           HW_ADMIN_JWT: _hwAdminJwt || '',
           HW_ADMIN_PHONE: user.phone || '',
           HW_API_BASE: process.env.HW_API_BASE || 'https://api.honourworld.com',
+          // HW_MONGO_URL_12MAY2026: mongo connection string for staff queries
+          MONGO_URL: _HW_MONGO_URL,
           LOGNAME: 'hwbot',
           FORCE_COLOR: '0',
           NO_COLOR: '1',
@@ -1846,6 +1892,29 @@ async function _processClaudePrompt(msg, prompt, user) {
     }
     const r2 = await _runClaude(fallback);
     stdout = r2.stdout; stderr = r2.stderr; exitCode = r2.exitCode; timedOut = r2.timedOut;
+  }
+
+  // HW_BOT_529_RETRY_22MAY2026 — Anthropic API overload (HTTP 529) is a
+  // transient server-side condition. The claude CLI surfaces it as
+  // "529" / "Overloaded" text in stdout/stderr. Rather than relaying
+  // that raw error to staff, retry the whole invocation with
+  // exponential backoff. Most 529s clear within a minute.
+  const _isOverload529 = (s) => /(\b529\b|overloaded)/i.test(s || '');
+  let _ovAttemptHW = 0;
+  while (
+    _ovAttemptHW < 3 &&
+    (exitCode !== 0 || !stdout.trim()) &&
+    _isOverload529(stdout + stderr)
+  ) {
+    _ovAttemptHW++;
+    const _ovBackoff = [8000, 20000, 40000][_ovAttemptHW - 1] || 40000;
+    console.warn(`[hw-bot] Anthropic 529 overload — retry ${_ovAttemptHW}/3 after ${_ovBackoff}ms`);
+    try {
+      _appendAudit(`${new Date().toISOString()} RETRY sender=${user.name}/${user.phone} reason=anthropic_529 attempt=${_ovAttemptHW}`);
+    } catch (_) {}
+    await new Promise((r) => setTimeout(r, _ovBackoff));
+    const _rOv = await _runClaude(args);
+    stdout = _rOv.stdout; stderr = _rOv.stderr; exitCode = _rOv.exitCode; timedOut = _rOv.timedOut;
   }
 
   const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
