@@ -73,6 +73,72 @@ function logUsage_BOT_USAGE_LOG_10MAY2026(fields) {
 
 const SHARED_TOKEN_FILE = process.env.HW_WA_TOKEN_FILE || '/etc/hw-whatsapp-bot.token';
 const HTTP_PORT = Number(process.env.HW_WA_HTTP_PORT || 9002);
+
+// WA_CRM_REPLY_25MAY2026 outgoing message_id -> ticket_number map.
+// Lets us route a quoted-reply on a CRM push back into the ticket.
+const TICKET_MAP_PATH = process.env.HW_WA_TICKET_MAP || '/var/lib/hw-whatsapp-bot/ticket-map.json';
+const TICKET_MAP_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const API_BOT_REPLY_URL = process.env.HW_API_BOT_REPLY_URL || 'https://api.honourworld.com/api/v2/crm/bot-reply';
+const API_BOT_REPLY_SECRET = (() => {
+  try {
+    const p = process.env.HW_BOT_REPLY_SECRET_FILE || '/etc/hw-bot-reply.secret';
+    return require('fs').readFileSync(p, 'utf8').trim();
+  } catch (_) { return process.env.HW_BOT_REPLY_SECRET || ''; }
+})();
+function _loadTicketMap() {
+  try { return JSON.parse(require('fs').readFileSync(TICKET_MAP_PATH, 'utf8')) || {}; }
+  catch (_) { return {}; }
+}
+function _saveTicketMap(map) {
+  try {
+    const now = Date.now();
+    for (const k of Object.keys(map)) {
+      if (!map[k]?.recordedAt || (now - map[k].recordedAt) > TICKET_MAP_TTL_MS) delete map[k];
+    }
+    require('fs').writeFileSync(TICKET_MAP_PATH, JSON.stringify(map, null, 2));
+  } catch (e) { log.warn({ err: e?.message }, 'ticket map save failed'); }
+}
+function _recordTicketSend(messageId, ticketNumber, toPhone) {
+  if (!messageId || !ticketNumber) return;
+  const map = _loadTicketMap();
+  map[String(messageId)] = { ticket_number: String(ticketNumber).toUpperCase(), to: String(toPhone || ''), recordedAt: Date.now() };
+  _saveTicketMap(map);
+}
+function _resolveTicketFromQuotedId(stanzaId) {
+  if (!stanzaId) return null;
+  const map = _loadTicketMap();
+  const hit = map[String(stanzaId)];
+  return hit?.ticket_number || null;
+}
+// Prefix parser for inbound replies: detects note: / resolve / reopen
+function _parseCrmCommand(text) {
+  const t = String(text || '').trim();
+  if (!t) return { kind: 'reply', body: '' };
+  const lower = t.toLowerCase();
+  if (/^note\s*[:-]\s*/i.test(t)) return { kind: 'note', body: t.replace(/^note\s*[:-]\s*/i, '').trim() };
+  if (lower === 'resolve' || lower === 'done' || lower === 'close' || lower === 'mark resolved') return { kind: 'resolve', body: '' };
+  if (lower === 'reopen' || lower === 'open' || lower === 'reopen ticket') return { kind: 'reopen', body: '' };
+  if (/^resolve\s*[:-]\s*/i.test(t)) return { kind: 'resolve', body: t.replace(/^resolve\s*[:-]\s*/i, '').trim() };
+  return { kind: 'reply', body: t };
+}
+async function _forwardToCrmReply({ phone, ticketNumber, body, kind }) {
+  if (!API_BOT_REPLY_SECRET) return { ok: false, error: 'BOT_REPLY_SECRET not configured' };
+  const payload = JSON.stringify({ phone, ticket_number: ticketNumber, body, kind });
+  const fetchFn = global.fetch || (await import('node-fetch').then(m => m.default).catch(() => null));
+  if (!fetchFn) return { ok: false, error: 'fetch not available' };
+  try {
+    const r = await fetchFn(API_BOT_REPLY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${API_BOT_REPLY_SECRET}` },
+      body: payload,
+    });
+    const json = await r.json().catch(() => ({}));
+    return { ok: r.ok, status: r.status, body: json };
+  } catch (e) {
+    return { ok: false, error: e?.message || String(e) };
+  }
+}
+
 const USERS_DB_PATH = process.env.HW_WA_USERS_DB || '/var/lib/hw-whatsapp-bot/wa-users.json';
 const AUTH_DIR = process.env.HW_WA_AUTH_DIR || '/var/lib/hw-whatsapp-bot/auth';
 const QR_PNG = '/var/log/hw-whatsapp-bot/last-qr.png';
@@ -834,6 +900,40 @@ async function _dispatch(m) {
       text_len: text.length,
     });
   } catch (_) {}
+
+  // WA_CRM_REPLY_25MAY2026 quoted-reply to a CRM ticket push? Route
+  // it back into the ticket via the API's /api/v2/crm/bot-reply.
+  try {
+    const ctx = m.message?.extendedTextMessage?.contextInfo;
+    const quotedId = ctx?.stanzaId || null;
+    const tnum = quotedId ? _resolveTicketFromQuotedId(quotedId) : null;
+    if (tnum && u?.phone) {
+      const body = m.message?.extendedTextMessage?.text || '';
+      const { kind, body: cleanBody } = _parseCrmCommand(body);
+      const result = await _forwardToCrmReply({
+        phone: u.phone,
+        ticketNumber: tnum,
+        body: cleanBody,
+        kind,
+      });
+      if (result?.ok) {
+        const d = result?.body?.data || {};
+        let ack;
+        if (kind === 'resolve')      ack = `✅ Resolved ${tnum}.`;
+        else if (kind === 'reopen')  ack = `↻ Reopened ${tnum}.`;
+        else if (d.demoted)          ack = `⚠️ ${d.preempterName || 'A teammate'} replied to ${tnum} ${d.preempterAgo || '?'}m ago. Your reply was added as an internal note instead.`;
+        else if (kind === 'note')    ack = `🔒 Internal note saved on ${tnum} (staff only).`;
+        else                         ack = `✉️ Reply sent to customer on ${tnum}.`;
+        try { await bot.sendMessage(jid, ack); } catch (_) {}
+      } else {
+        const errMsg = result?.body?.error?.[0]?.msg || result?.body?.msg || result?.error || `HTTP ${result?.status || '?'}`;
+        try { await bot.sendMessage(jid, `❌ Could not post your reply to ${tnum}: ${errMsg}`); } catch (_) {}
+      }
+      return; // handled
+    }
+  } catch (e) {
+    try { log.warn({ err: e?.message }, 'CRM quoted-reply dispatch failed'); } catch (_) {}
+  }
 
   // Auto-share contact on /start: WhatsApp has no contact-share UX
   // button, so synthesise the contact event when /start arrives from
@@ -2034,7 +2134,9 @@ app.post('/send', async (req, res) => {
   // provided, we use bot.sendPhoto; otherwise the legacy sendMessage path.
   // Telegram caption limit is 1024 chars — overflow falls back to a
   // photo + follow-up text message.
-  const { to, message, image } = req.body || {};
+  // WA_CRM_REPLY_25MAY2026 accept ticket_number so future quoted
+  // replies can be mapped back to the ticket.
+  const { to, message, image, ticket_number } = req.body || {};
   if (!to || !message) return res.status(400).json({ error: '`to` and `message` required' });
 
   // `to` may be: (a) a phone number (look up registered user),
@@ -2108,11 +2210,13 @@ app.post('/send', async (req, res) => {
         sent = await bot.sendMessage((r.jid || r.chatId || r.phone), String(message), { parse_mode: 'Markdown' });
       }
       results.push({ ok: true, name: r.name, msgId: sent.message_id });
+      if (ticket_number) try { _recordTicketSend(sent?.message_id, ticket_number, r.phone); } catch (_) {} // WA_CRM_REPLY_25MAY2026
     } catch (e) {
       // Markdown parse failure or photo URL fetch failure → retry plain text
       try {
         const sent = await bot.sendMessage((r.jid || r.chatId || r.phone), String(message));
         results.push({ ok: true, name: r.name, msgId: sent.message_id, plain: true });
+        if (ticket_number) try { _recordTicketSend(sent?.message_id, ticket_number, r.phone); } catch (_) {} // WA_CRM_REPLY_25MAY2026
       } catch (e2) {
         results.push({ ok: false, name: r.name, error: e2?.message || 'send failed' });
       }
