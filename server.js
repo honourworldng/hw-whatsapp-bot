@@ -2120,6 +2120,44 @@ app.get('/healthz', (_req, res) => {
   });
 });
 
+// WA_BOT_SEND_CUSTOMER_03JUN2026 - free outbound WA nudges for KYC +
+// dormant campaigns (Infobip retired due to NGN 0 balance). Accepts
+// any E.164 phone, bypassing the staff-db gate on /send. Auth via
+// shared token in env HW_WA_BOT_TOKEN to prevent random callers from
+// blasting our number. Rate limit + opt-out tracking lives on the
+// CALLER side (kyc_dropoff_nudge.py caps at 50/day).
+app.post('/send/customer', async (req, res) => {
+  try {
+    const HW_TOK = process.env.HW_WA_BOT_TOKEN || '';
+    const got = req.header('x-hw-token') || '';
+    if (!HW_TOK || got !== HW_TOK) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
+    }
+    const { to, message, kind } = req.body || {};
+    if (!to || !message) {
+      return res.status(400).json({ ok: false, error: '`to` and `message` required' });
+    }
+    // Normalise to E.164 digit string (Baileys _toJid handles the @c.us suffix)
+    const phone = String(to).replace(/[^0-9]/g, '');
+    if (phone.length < 10 || phone.length > 15) {
+      return res.status(400).json({ ok: false, error: `invalid phone: ${to}` });
+    }
+    if (!_sock || !_connected) {
+      return res.status(503).json({ ok: false, error: 'WhatsApp socket not connected' });
+    }
+    try {
+      const r = await _sock.sendMessage(_toJid(phone), { text: _waSafe(String(message)) });
+      console.log(`[send/customer] ${kind || 'msg'} -> ${phone}  id=${r?.key?.id}`);
+      return res.json({ ok: true, message_id: r?.key?.id });
+    } catch (err) {
+      console.error(`[send/customer] send failed: ${err?.message || err}`);
+      return res.status(500).json({ ok: false, error: String(err?.message || err).slice(0, 200) });
+    }
+  } catch (outer) {
+    return res.status(500).json({ ok: false, error: String(outer?.message || outer).slice(0, 200) });
+  }
+});
+
 app.post('/send', async (req, res) => {
   // Dedup guard — skip identical (to + message + image) within last 60s.
   const dedup = _isDuplicateSend(req.body || {});
