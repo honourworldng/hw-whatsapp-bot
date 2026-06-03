@@ -71,6 +71,33 @@ function logUsage_BOT_USAGE_LOG_10MAY2026(fields) {
 }
 
 
+// WA_BOT_OUTBOUND_TELEMETRY_03JUN2026
+// Append-only event log for outbound /send/customer pushes:
+//   {event:"sent", messageId, to, kind, sentAt, length, preview}
+//   {event:"delivered"|"read"|"played", messageId, to, at}
+//   {event:"replied", quotedMessageId, from, at, preview}
+// Reader reduces by messageId to compute send/delivered/read/reply rates.
+const _WA_OUTBOUND_LOG = '/var/www/hw-whatsapp-bot/wa_outbound.jsonl';
+function _waOutboundLog(obj) {
+  try {
+    fs.appendFileSync(_WA_OUTBOUND_LOG, JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n');
+  } catch (e) {
+    try { console.error('wa_outbound logger failed:', e?.message); } catch (_) {}
+  }
+}
+// Recent outbound message-id -> {to, kind, sentAt} map (in-memory, 24h TTL)
+// so messages.update + reply-detection can join back to context.
+const _WA_OUTBOUND_RECENT = new Map();
+function _rememberOutbound(messageId, to, kind) {
+  if (!messageId) return;
+  _WA_OUTBOUND_RECENT.set(messageId, { to, kind, at: Date.now() });
+  // Prune entries older than 24h
+  if (_WA_OUTBOUND_RECENT.size > 2000) {
+    const cutoff = Date.now() - 24*60*60*1000;
+    for (const [k, v] of _WA_OUTBOUND_RECENT) if (v.at < cutoff) _WA_OUTBOUND_RECENT.delete(k);
+  }
+}
+
 const SHARED_TOKEN_FILE = process.env.HW_WA_TOKEN_FILE || '/etc/hw-whatsapp-bot.token';
 const HTTP_PORT = Number(process.env.HW_WA_HTTP_PORT || 9002);
 
@@ -812,10 +839,64 @@ async function _connectWhatsApp() {
       if (reconnect) setTimeout(() => _connectWhatsApp().catch((e) => log.error(e)), 3000);
     }
   });
+  // WA_BOT_OUTBOUND_TELEMETRY_03JUN2026: subscribe to receipt updates
+  // Baileys emits messages.update with key.id + update.status (2=server-ack,
+  // 3=delivered, 4=read, 5=played). We map 3/4/5 to readable events and only
+  // record updates for outbound messages we sent via /send/customer.
+  _sock.ev.on('messages.update', async (updates) => {
+    try {
+      const STATUS_NAMES = { 1: 'pending', 2: 'sent', 3: 'delivered', 4: 'read', 5: 'played' };
+      for (const u of (updates || [])) {
+        const mid = u?.key?.id;
+        if (!mid) continue;
+        const known = _WA_OUTBOUND_RECENT.get(mid);
+        if (!known) continue; // only track customer-pushes we initiated
+        const st = u?.update?.status;
+        if (typeof st !== 'number') continue;
+        if (st < 3) continue; // skip "sent" duplicates; we already logged that
+        _waOutboundLog({
+          event: STATUS_NAMES[st] || ('status_' + st),
+          messageId: mid,
+          to: known.to,
+          kind: known.kind,
+          at: new Date().toISOString(),
+        });
+      }
+    } catch (e) {
+      try { log.error({ err: e?.message }, 'wa_outbound update handler threw'); } catch (_) {}
+    }
+  });
+
   _sock.ev.on('messages.upsert', async ({ messages, type }) => {
     log.info({ type, count: messages?.length, fromMe: messages?.[0]?.key?.fromMe, jid: messages?.[0]?.key?.remoteJid }, 'messages.upsert');
     if (type !== 'notify') return;
     for (const m of messages) {
+      // WA_BOT_OUTBOUND_TELEMETRY_03JUN2026: did this customer just reply
+      // to one of our outbound nudge pushes? If the message quotes a
+      // stanzaId we recently sent, log a 'replied' event.
+      try {
+        const quoted = m?.message?.extendedTextMessage?.contextInfo?.stanzaId
+                    || m?.message?.imageMessage?.contextInfo?.stanzaId
+                    || m?.message?.videoMessage?.contextInfo?.stanzaId
+                    || m?.message?.conversation && m?.contextInfo?.stanzaId;
+        if (quoted && _WA_OUTBOUND_RECENT.has(quoted)) {
+          const known = _WA_OUTBOUND_RECENT.get(quoted);
+          const replyText = m?.message?.extendedTextMessage?.text
+                         || m?.message?.conversation
+                         || '';
+          _waOutboundLog({
+            event: 'replied',
+            quotedMessageId: quoted,
+            from: m?.key?.remoteJid,
+            originalTo: known?.to,
+            originalKind: known?.kind,
+            at: new Date().toISOString(),
+            preview: String(replyText).slice(0, 80),
+          });
+        }
+      } catch (e) {
+        try { log.error({ err: e?.message }, 'wa_outbound reply detect threw'); } catch (_) {}
+      }
       try { await _dispatch(m); }
       catch (e) { log.error({ err: e?.message }, 'dispatch threw'); }
     }
@@ -2147,8 +2228,20 @@ app.post('/send/customer', async (req, res) => {
     }
     try {
       const r = await _sock.sendMessage(_toJid(phone), { text: _waSafe(String(message)) });
-      console.log(`[send/customer] ${kind || 'msg'} -> ${phone}  id=${r?.key?.id}`);
-      return res.json({ ok: true, message_id: r?.key?.id });
+      const mid = r?.key?.id;
+      console.log(`[send/customer] ${kind || 'msg'} -> ${phone}  id=${mid}`);
+      // WA_BOT_OUTBOUND_TELEMETRY_03JUN2026: record + remember
+      _waOutboundLog({
+        event: 'sent',
+        messageId: mid,
+        to: phone,
+        kind: kind || 'msg',
+        sentAt: new Date().toISOString(),
+        length: String(message).length,
+        preview: String(message).slice(0, 80),
+      });
+      _rememberOutbound(mid, phone, kind || 'msg');
+      return res.json({ ok: true, message_id: mid });
     } catch (err) {
       console.error(`[send/customer] send failed: ${err?.message || err}`);
       return res.status(500).json({ ok: false, error: String(err?.message || err).slice(0, 200) });
