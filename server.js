@@ -85,6 +85,73 @@ function _waOutboundLog(obj) {
     try { console.error('wa_outbound logger failed:', e?.message); } catch (_) {}
   }
 }
+// WA_BOT_BULK_THROTTLE_04JUN2026: in-bot daily cap + per-recipient cooldown
+// + bulk-kind kill switch. Persists counters across restarts. Triggered
+// after WhatsApp restricted the bot's linked-device feature 4 Jun 2026.
+const _WA_THROTTLE_PATH = '/var/lib/hw-whatsapp-bot/throttle.json';
+const _WA_BULK_KINDS = new Set([
+  'kyc_nudge', 'cable_elec_winback', 'dormant_winback', 'win_back', 'winback',
+  'nudge', 'marketing', 'broadcast', 'campaign',
+]);
+// Default 7-day bulk pause from 4 Jun 2026 23:59 UTC; override via env.
+const _WA_BULK_PAUSED_UNTIL = new Date(process.env.WA_BULK_PAUSED_UNTIL || '2026-06-11T23:59:59Z');
+const _WA_DAILY_CAP = Number(process.env.WA_DAILY_CAP || 10);
+const _WA_COOLDOWN_DAYS = Number(process.env.WA_COOLDOWN_DAYS || 7);
+
+function _loadThrottle() {
+  try { return JSON.parse(fs.readFileSync(_WA_THROTTLE_PATH, 'utf8')); }
+  catch (_) { return { dayKey: '', dayCount: 0, lastSeenByPhone: {} }; }
+}
+function _saveThrottle(t) {
+  try { fs.writeFileSync(_WA_THROTTLE_PATH, JSON.stringify(t), { mode: 0o600 }); }
+  catch (e) { try { console.error('throttle save failed:', e?.message); } catch (_) {} }
+}
+function _dayKeyUTC() {
+  const d = new Date();
+  return d.getUTCFullYear() + '-' + String(d.getUTCMonth()+1).padStart(2,'0') + '-' + String(d.getUTCDate()).padStart(2,'0');
+}
+function _checkThrottle({ phone, kind }) {
+  // Returns { ok: true } or { ok: false, code: <http>, error: <string> }.
+  // Bulk-kind kill switch first.
+  if (kind && _WA_BULK_KINDS.has(String(kind).toLowerCase())) {
+    if (Date.now() < _WA_BULK_PAUSED_UNTIL.getTime()) {
+      return {
+        ok: false, code: 503,
+        error: `BULK_PAUSED: kind "${kind}" is bulk-throttled until ${_WA_BULK_PAUSED_UNTIL.toISOString()} (WA anti-spam restriction recovery)`,
+      };
+    }
+  }
+  const t = _loadThrottle();
+  const today = _dayKeyUTC();
+  if (t.dayKey !== today) { t.dayKey = today; t.dayCount = 0; }
+  // Per-recipient 7-day cooldown.
+  const lastSent = t.lastSeenByPhone?.[phone];
+  if (lastSent) {
+    const ageMs = Date.now() - lastSent;
+    const cdMs = _WA_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
+    if (ageMs < cdMs) {
+      const remainingH = Math.ceil((cdMs - ageMs) / (60*60*1000));
+      return {
+        ok: false, code: 429,
+        error: `RECIPIENT_COOLDOWN: phone ${phone} received a push less than ${_WA_COOLDOWN_DAYS}d ago; ${remainingH}h remaining`,
+      };
+    }
+  }
+  if (t.dayCount >= _WA_DAILY_CAP) {
+    return {
+      ok: false, code: 429,
+      error: `DAILY_CAP_EXHAUSTED: ${_WA_DAILY_CAP}/day reached for ${today}`,
+    };
+  }
+  return { ok: true, throttle: t };
+}
+function _consumeThrottle({ phone, throttle }) {
+  throttle.dayCount = (throttle.dayCount || 0) + 1;
+  throttle.lastSeenByPhone = throttle.lastSeenByPhone || {};
+  throttle.lastSeenByPhone[phone] = Date.now();
+  _saveThrottle(throttle);
+}
+
 // Recent outbound message-id -> {to, kind, sentAt} map (in-memory, 24h TTL)
 // so messages.update + reply-detection can join back to context.
 const _WA_OUTBOUND_RECENT = new Map();
@@ -2226,6 +2293,19 @@ app.post('/send/customer', async (req, res) => {
     if (!_sock || !_connected) {
       return res.status(503).json({ ok: false, error: 'WhatsApp socket not connected' });
     }
+    // WA_BOT_BULK_THROTTLE_04JUN2026: gate before sending.
+    const _throttle = _checkThrottle({ phone, kind });
+    if (!_throttle.ok) {
+      console.warn(`[send/customer] throttle reject: ${_throttle.error}`);
+      _waOutboundLog({
+        event: 'throttle_rejected',
+        to: phone,
+        kind: kind || 'msg',
+        reason: _throttle.error,
+        at: new Date().toISOString(),
+      });
+      return res.status(_throttle.code).json({ ok: false, error: _throttle.error });
+    }
     try {
       const r = await _sock.sendMessage(_toJid(phone), { text: _waSafe(String(message)) });
       const mid = r?.key?.id;
@@ -2241,6 +2321,7 @@ app.post('/send/customer', async (req, res) => {
         preview: String(message).slice(0, 80),
       });
       _rememberOutbound(mid, phone, kind || 'msg');
+      _consumeThrottle({ phone, throttle: _throttle.throttle });
       return res.json({ ok: true, message_id: mid });
     } catch (err) {
       console.error(`[send/customer] send failed: ${err?.message || err}`);
