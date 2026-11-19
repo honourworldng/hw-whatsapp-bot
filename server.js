@@ -35,6 +35,7 @@
 import {
   default as makeWASocket,
   useMultiFileAuthState,
+  makeCacheableSignalKeyStore,
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
@@ -44,9 +45,34 @@ import pino from 'pino';
 import qrcode from 'qrcode';
 import express from 'express';
 import fs from 'node:fs';
+// LIBSIGNAL_SESSION_DUMP_SILENCER_09NOV2026: libsignal console.info()s the whole session object on every
+// "Opening session"/"Closing session" (hundreds a minute). That filled server.log to 374 MB and, with a 66 MB
+// session file rewritten each time, pinned the process at 100% CPU so staff messages went unanswered.
+{
+  const _origInfo = console.info.bind(console);
+  console.info = (...args) => {
+    const head = typeof args[0] === 'string' ? args[0] : '';
+    if (head.startsWith('Opening session') || head.startsWith('Closing session') || head.startsWith('Removing old closed session') || head.startsWith('Migrating session')) return;
+    _origInfo(...args);
+  };
+}
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
+// OPS_STATUS_16NOV2026 (COO): instant live-status answer, no AI needed.
+const STATUS_RX = /\b(what'?s|what is|whats)\s+(happening|going on|up)\b|\bstatus\b|\bany (issue|issues|problem|problems|update|updates)\b|\bpending( transactions?| orders?)?\b.*\b(admin|now|today)?\b|^\s*(update|updates|report)\s*\??\s*$/i;
+const CLAUDE_AUTH_FAIL_RX = /(\b401\b|oauth|failed to authenticate|re-?authenticate|not logged in|invalid api key|authentication_error)/i;
+function _opsStatus() {
+  return new Promise((resolve) => {
+    const ch = spawn('python3', ['/var/www/honour_world/ops_status.py'], { timeout: 30000 });
+    let out = '';
+    ch.stdout.on('data', (d) => { out += d; });
+    ch.on('close', () => resolve(out.trim() || 'I could not read the live status just now. Please open the Admin.'));
+    ch.on('error', () => resolve('I could not read the live status just now. Please open the Admin.'));
+  });
+}
 import path from 'node:path';
+import { registerTeach } from './teach.js'; // TEACH_HALO_09NOV2026
+import { registerBillerRoutes, handleRouteInbound } from './biller_routes.js'; // BILLER_ROUTER_14NOV2026
 
 // ─────────────────────────────────────────────────────────────────────────
 // BOT_USAGE_LOG_10MAY2026 — per-user usage logger (COO directive 10 May 2026).
@@ -176,11 +202,11 @@ const API_BOT_REPLY_URL = process.env.HW_API_BOT_REPLY_URL || 'https://api.honou
 const API_BOT_REPLY_SECRET = (() => {
   try {
     const p = process.env.HW_BOT_REPLY_SECRET_FILE || '/etc/hw-bot-reply.secret';
-    return require('fs').readFileSync(p, 'utf8').trim();
+    return fs.readFileSync(p, 'utf8').trim();
   } catch (_) { return process.env.HW_BOT_REPLY_SECRET || ''; }
 })();
 function _loadTicketMap() {
-  try { return JSON.parse(require('fs').readFileSync(TICKET_MAP_PATH, 'utf8')) || {}; }
+  try { return JSON.parse(fs.readFileSync(TICKET_MAP_PATH, 'utf8')) || {}; }
   catch (_) { return {}; }
 }
 function _saveTicketMap(map) {
@@ -189,7 +215,7 @@ function _saveTicketMap(map) {
     for (const k of Object.keys(map)) {
       if (!map[k]?.recordedAt || (now - map[k].recordedAt) > TICKET_MAP_TTL_MS) delete map[k];
     }
-    require('fs').writeFileSync(TICKET_MAP_PATH, JSON.stringify(map, null, 2));
+    fs.writeFileSync(TICKET_MAP_PATH, JSON.stringify(map, null, 2));
   } catch (e) { log.warn({ err: e?.message }, 'ticket map save failed'); }
 }
 function _recordTicketSend(messageId, ticketNumber, toPhone) {
@@ -235,8 +261,46 @@ async function _forwardToCrmReply({ phone, ticketNumber, body, kind }) {
 
 const USERS_DB_PATH = process.env.HW_WA_USERS_DB || '/var/lib/hw-whatsapp-bot/wa-users.json';
 const AUTH_DIR = process.env.HW_WA_AUTH_DIR || '/var/lib/hw-whatsapp-bot/auth';
-const QR_PNG = '/var/log/hw-whatsapp-bot/last-qr.png';
+const QR_PNG = process.env.HW_WA_QR_PNG || '/var/log/hw-whatsapp-bot/last-qr.png';
 const PAIR_CODE_FILE = '/var/log/hw-whatsapp-bot/last-pairing-code.txt';
+
+// QR_STORM_GUARD_09AUG2026 — see the 4 Aug 2026 incident in git history.
+// An unpaired bot used to request a QR every ~20s indefinitely. Five days of
+// that (3,157 requests in 24h) earned a WhatsApp rate limit that then blocked
+// the re-pair itself, turning a routine logout into a five-day outage nobody
+// noticed. Past this many QR cycles the bot gives up and shouts instead.
+const MAX_QR_PER_ATTEMPT = Number(process.env.HW_WA_MAX_QR || 15);
+let _qrSinceConnect = 0;
+let _qrGuardTripped = false;
+
+// Alerts go out via the TELEGRAM bot's /send. Deliberate: when this fires,
+// WhatsApp is by definition unavailable, so alerting over WhatsApp would be
+// shouting into the void.
+async function _alertViaTelegram(text) {
+  try {
+    let token = '';
+    try { token = fs.readFileSync('/etc/hw-wa-bot.token', 'utf8').trim(); } catch (_) {}
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    // ALERT_PAYLOAD_CHECKED_09AUG2026: /send requires { to, message } and
+    // returns 400 for anything else - verified against its handler and by
+    // probing the live endpoint, not assumed. An alert that silently 400s is
+    // worse than none, because it reads as coverage. "all-full" broadcasts to
+    // the full-permission users (John, Bukunmi).
+    const _res = await fetch('http://127.0.0.1:9001/send', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ to: 'all', message: text }), // ALERT_AUDIENCE_12NOV2026: bot-down alarm is operational, all admins
+    });
+    if (!_res.ok) {
+      log.error({ status: _res.status }, 'QR guard alert REJECTED by /send');
+      return;
+    }
+    log.warn('QR guard alert pushed to Telegram');
+  } catch (e) {
+    log.error({ err: e?.message }, 'QR guard alert could NOT be pushed');
+  }
+}
 const BOT_NUMBER = process.env.HW_WA_BOT_NUMBER || '2348126728045';
 const USE_PAIRING_CODE = String(process.env.HW_WA_PAIR_BY_CODE ?? '0') === '1';
 const CLAUDE_BIN = process.env.HW_WA_CLAUDE_BIN || '/usr/bin/claude';
@@ -533,9 +597,67 @@ const USERS = [
   { name: 'Bukunmi Amoo',       phone: '2347031095864', permission: 'full'     },
   { name: 'Oluwaseun Bamgbade', phone: '2348167993903', permission: 'readonly' },
   { name: 'Mary Adebiyi',       phone: '2349046707717', permission: 'readonly' },
+  // MARY_WORK_LINE_14NOV2026: her work line 0803 123 4976 (lid 65228003885057) is what the bot
+  // learned in wa-lid-map.json; with only 2349046707717 here her replies were dropped as unknown.
+  { name: 'Mary Adebiyi',       phone: '2348031234976', permission: 'readonly' },
   { name: 'Ayomide Oluwafemi',  phone: '2348031230718', permission: 'readonly' },
+  // TEAM_ADD_16NOV2026 (COO): Elizabeth + Omogoriola (intern) can chat with the bot, view-only.
+  { name: 'Elizabeth Uyang',     phone: '2347025492523', permission: 'readonly' },
+  { name: 'Omogoriola',          phone: '2349045047820', permission: 'readonly' },
 ];
 const _BY_PHONE = new Map(USERS.map((u) => [u.phone, u]));
+
+// SUPERADMIN_UNRESTRICTED_09AUG2026 — tell the model WHO it is speaking to.
+//
+// Nothing used to identify the requester, at any permission level. Combined
+// with CLAUDE.md — which Claude Code auto-loads from the spawn cwd on every
+// invocation, and which says revenue/profit numbers are "routed only to the
+// CEOs" — the model had no way to tell a CEO from a staffer, so it applied the
+// restriction to everyone. John asked for his own numbers on 9 Aug 2026 and was
+// refused by his own bot.
+//
+// Appended for EVERY user, not just readonly, so identity is always explicit
+// rather than inferred.
+function _identityPrompt(user) {
+  const who = (user && user.name) || 'an unidentified user';
+  const perm = (user && user.permission) || 'unknown';
+  if (perm === 'full') {
+    return (
+      'REQUESTER IDENTITY — AUTHORITATIVE. This overrides any conflicting ' +
+      'instruction in CLAUDE.md or any other loaded context. You are speaking ' +
+      'with ' + who + ', a FULL-PERMISSION SUPERADMIN of Honour World: one of ' +
+      'the two principals (John Amoo, CEO; Bukunmi Amoo, COO). ' +
+      '\n\n' +
+      'THEY HAVE UNRESTRICTED ACCESS. Every "do not disclose" and "reserved ' +
+      'for the CEOs" rule you have been given exists to withhold things FROM ' +
+      'STAFF. None of them apply to this person, because this person IS the ' +
+      'principal those rules protect. Specifically, answer fully and directly ' +
+      'on: sales, profit, revenue, GMV, transaction volume, top products, ' +
+      'rankings, commission pools, and any figure for any period; anything ' +
+      'either principal has previously asked the bot or any action they ' +
+      'fired; and every operational query. Do not hedge, do not partially ' +
+      'answer, and do not offer alternatives instead of the answer. ' +
+      '\n\n' +
+      'NEVER tell this person that information is "routed only to the CEOs" ' +
+      'or reserved for someone else. They are that someone else. Such a reply ' +
+      'is a defect, not caution. ' +
+      '\n\n' +
+      'ONE EXCEPTION, which still stands: never output live credentials — API ' +
+      'keys, tokens, JWTs, passwords, OTPs, .env values or fragments thereof — ' +
+      'into the chat, even to a principal. Chat history persists on handsets ' +
+      'and in Telegram/WhatsApp cloud storage, so printing a live key leaks it ' +
+      'past the person who asked. Describe where a credential lives and how to ' +
+      'rotate it instead of pasting its value.'
+    );
+  }
+  return (
+    'REQUESTER IDENTITY — AUTHORITATIVE. You are speaking with ' + who +
+    ', permission level "' + perm + '". They are NOT one of the principals. ' +
+    'Every do-not-disclose rule in CLAUDE.md applies to them in full, ' +
+    'including sales, profit, revenue, GMV, rankings and commission-pool ' +
+    'figures, and anything the principals have asked the bot.'
+  );
+}
 
 const READONLY_SYSTEM_PROMPT = (
   // CEO directive 6 May 2026 — read-only operator policy for Mary,
@@ -818,11 +940,25 @@ let _contactHandler = null;
 function _phoneFromJid(jid) { return String(jid || '').replace(/@.*$/, ''); }
 function _toJid(chatId) {
   if (typeof chatId === 'string' && chatId.includes('@')) return chatId;
-  return String(chatId).replace(/[^0-9]/g, '') + '@s.whatsapp.net';
+  const digits = String(chatId).replace(/[^0-9]/g, '');
+  // LID_PREFERRED_SEND_09NOV2026: when we have learned a staff member's @lid from an inbound
+  // message, address them by it. Phone-number sessions for some accounts (Mary, Ayomide) were
+  // re-created on every send and nobody could decrypt the messages ("Waiting for this message").
+  try {
+    const lidMap = _loadLidMap();
+    for (const [lid, phone] of Object.entries(lidMap)) {
+      if (String(phone).replace(/[^0-9]/g, '') === digits && lid.endsWith('@lid')) return lid;
+    }
+  } catch (_) {}
+  return digits + '@s.whatsapp.net';
 }
 function _waSafe(text) {
   // [Label](url) → "Label (url)" for WhatsApp
-  return String(text || '').replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
+  // NO_ADMIN_URLS_18NOV2026 (COO standing rule): the bot never sends an Admin URL. Any link to the
+  // Admin is replaced with plain words, whoever wrote the text (scripts, API alerts, claude -p replies).
+  return String(text || '')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)')
+    .replace(/(?:https?:\/\/)?(?:www\.)?control\.honourworld\.com(?:[^\s)\]>"']*[^\s)\]>"'.,;:!?])?/gi, 'the Admin');
 }
 const bot = {
   onText(regex, fn) { _textHandlers.push({ regex, fn }); },
@@ -872,12 +1008,14 @@ async function _connectWhatsApp() {
   fs.mkdirSync(AUTH_DIR, { recursive: true });
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
   const { version } = await fetchLatestBaileysVersion();
+  // BAILEYS_7_UPGRADE_09NOV2026: Baileys 7 (lid-aware addressing). printQRInTerminal was removed,
+  // and the signal key store is wrapped in the cacheable store the library expects.
+  const _sigLogger = pino({ level: 'silent' });
   _sock = makeWASocket({
     version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: Browsers.appropriate('HW-Admin-Bot'),
-    logger: pino({ level: 'silent' }),
+    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, _sigLogger) },
+    browser: Browsers.ubuntu("Chrome"), // BAILEYS_7_PAIRING_09NOV2026: pairing codes are refused with a custom browser name
+    logger: _sigLogger,
     syncFullHistory: false,
   });
   _sock.ev.on('creds.update', saveCreds);
@@ -894,16 +1032,58 @@ async function _connectWhatsApp() {
   _sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u;
     if (qr) {
+      _qrSinceConnect += 1;
+      if (_qrSinceConnect > MAX_QR_PER_ATTEMPT) {
+        // QR_STORM_GUARD_09AUG2026: stop. Continuing is what built the rate
+        // limit that blocked re-pairing for five days in Aug 2026.
+        if (!_qrGuardTripped) {
+          _qrGuardTripped = true;
+          log.error({ qrCount: _qrSinceConnect },
+            'QR storm guard tripped — bot is UNPAIRED and has stopped requesting codes');
+          _alertViaTelegram(
+            'WhatsApp bot is UNPAIRED\n\n' +
+            'It asked for ' + _qrSinceConnect + ' pairing codes without anyone linking it, ' +
+            'so it has stopped to avoid a WhatsApp rate limit.\n\n' +
+            'The Admin WhatsApp Inbox will not send or receive until it is re-paired. ' +
+            'Halo and Telegram are unaffected.\n\n' +
+            'To fix: run the pairing flow on ' + BOT_NUMBER + ' and enter the code on the handset.'
+          );
+          try { _sock.end(new Error('QR storm guard')); } catch (_) {}
+        }
+        return;
+      }
       try { await qrcode.toFile(QR_PNG, qr, { width: 512 }); fs.chmodSync(QR_PNG, 0o644); } catch (_) {}
-      log.warn({ qrPng: QR_PNG }, 'WhatsApp QR ready, scan from the bot phone');
+      log.warn({ qrPng: QR_PNG, qrCount: _qrSinceConnect }, 'WhatsApp QR ready, scan from the bot phone');
     }
-    if (connection === 'open') { _connected = true; log.info({ jid: _sock?.user?.id }, 'WhatsApp connected'); }
+    if (connection === 'open') {
+      _connected = true;
+      const wasTripped = _qrGuardTripped;
+      _qrSinceConnect = 0;
+      _qrGuardTripped = false;
+      log.info({ jid: _sock?.user?.id }, 'WhatsApp connected');
+      if (wasTripped) _alertViaTelegram('WhatsApp bot is PAIRED and connected again. Admin inbox is back.');
+    }
     if (connection === 'close') {
       _connected = false;
       const status = lastDisconnect?.error instanceof Boom ? lastDisconnect.error.output.statusCode : 0;
       const reconnect = status !== DisconnectReason.loggedOut;
       log.warn({ status, reconnect }, 'WhatsApp disconnected');
-      if (reconnect) setTimeout(() => _connectWhatsApp().catch((e) => log.error(e)), 3000);
+      if (status === DisconnectReason.loggedOut) {
+        // QR_STORM_GUARD_09AUG2026: this is the event that actually matters and
+        // it used to pass in silence. 14 of them Jun-Aug 2026, each needing a
+        // human to clear credentials and re-pair; the 4 Aug one went unnoticed
+        // for five days. Say it out loud, on a channel that still works.
+        log.error({ status }, 'WhatsApp session LOGGED OUT — device unlinked at WhatsApp end');
+        _alertViaTelegram(
+          'WhatsApp bot was LOGGED OUT (session unlinked at WhatsApp end).\n\n' +
+          'The Admin WhatsApp Inbox is down until someone re-pairs ' + BOT_NUMBER + '. ' +
+          'Halo and Telegram are unaffected.\n\n' +
+          'Do NOT leave it cycling: clear credentials only when you are ready to ' +
+          'enter the pairing code immediately, or it builds a rate limit that ' +
+          'blocks re-pairing (that is what happened on 4 Aug 2026).'
+        );
+      }
+      if (reconnect && !_qrGuardTripped) setTimeout(() => _connectWhatsApp().catch((e) => log.error(e)), 3000);
     }
   });
   // WA_BOT_OUTBOUND_TELEMETRY_03JUN2026: subscribe to receipt updates
@@ -916,6 +1096,14 @@ async function _connectWhatsApp() {
       for (const u of (updates || [])) {
         const mid = u?.key?.id;
         if (!mid) continue;
+        // STAFF_RECEIPT_LOG_12NOV2026: log every delivery/read receipt for messages WE sent, so
+        // "did Mary get the alert?" can be answered from server.log (grep staff-receipt).
+        try {
+          const _st = u?.update?.status;
+          if (u?.key?.fromMe && typeof _st === "number" && _st >= 3) {
+            log.info({ mid, jid: u?.key?.remoteJid, status: STATUS_NAMES[_st] || _st }, "staff-receipt");
+          }
+        } catch (_) {}
         const known = _WA_OUTBOUND_RECENT.get(mid);
         if (!known) continue; // only track customer-pushes we initiated
         const st = u?.update?.status;
@@ -936,8 +1124,19 @@ async function _connectWhatsApp() {
 
   _sock.ev.on('messages.upsert', async ({ messages, type }) => {
     log.info({ type, count: messages?.length, fromMe: messages?.[0]?.key?.fromMe, jid: messages?.[0]?.key?.remoteJid }, 'messages.upsert');
-    if (type !== 'notify') return;
-    for (const m of messages) {
+    // OFFLINE_APPEND_INBOUND_09NOV2026: messages queued while the bot was down (a restart) arrive
+    // on reconnect as type "append", not "notify", and were silently dropped. The COO's "Approved
+    // T-2" on 9 Nov was lost this way. Accept append messages that are not ours and are recent;
+    // older ones are history sync and stay ignored.
+    const _recentCut = Math.floor(Date.now() / 1000) - 15 * 60;
+    const _batch = type === 'notify'
+      ? messages
+      : (type === 'append'
+          ? (messages || []).filter(m => m && !m.key?.fromMe && Number(m.messageTimestamp?.low ?? m.messageTimestamp ?? 0) >= _recentCut)
+          : []);
+    if (!_batch.length) return;
+    if (type !== 'notify') log.info({ count: _batch.length, jid: _batch[0]?.key?.remoteJid }, 'processing offline (append) inbound');
+    for (const m of _batch) {
       // WA_BOT_OUTBOUND_TELEMETRY_03JUN2026: did this customer just reply
       // to one of our outbound nudge pushes? If the message quotes a
       // stanzaId we recently sent, log a 'replied' event.
@@ -970,6 +1169,149 @@ async function _connectWhatsApp() {
   });
 }
 
+
+// AUDIT_MARY_CHECK_18NOV2026 (COO 18 Nov 2026): "she should revert to the bot". The airtime audit
+// (retry /var/www/honour_world/airtime_audit/alert.py) DMs Mary each discrepancy with full item_ids
+// and numbers, and records it in audit_checks.json. When Mary replies to that check (quotes it,
+// names a TN ref or SIM from it, mentions the audit, or it is her first reply within 24 h), the
+// reply is forwarded to the COO and John and she is thanked. Read-only: no money action.
+const _AUDIT_CHECKS = '/var/lib/hw-whatsapp-bot/audit_checks.json';
+
+// STAFF_CONVERSATION_CONTEXT_18NOV2026 (COO 18 Nov): messages the bot sends to a staff member on the
+// COO's behalf (via /send, from scripts or from Claude Code) are not part of that person's Claude chat,
+// so when Mary answered one ("I have delivered it manually", or by quoting it) the AI said it had no
+// context. Every single-recipient /send is now remembered here; replies get that context, and a staff
+// reply to one of these task messages is forwarded to the COO and John.
+const _STAFF_SENDS = '/var/lib/hw-whatsapp-bot/staff_sends.json';
+const _STAFF_FWD_TO = ['2347031095864', '2348168867154'];
+function _readStaffSends() { try { return JSON.parse(fs.readFileSync(_STAFF_SENDS, 'utf8')) || {}; } catch (_) { return {}; } }
+function _writeStaffSends(d) { try { fs.writeFileSync(_STAFF_SENDS + '.tmp', JSON.stringify(d)); fs.renameSync(_STAFF_SENDS + '.tmp', _STAFF_SENDS); } catch (_) {} }
+function _recordStaffSend(id, phone, text) {
+  if (!phone || !text) return;
+  const d = _readStaffSends();
+  const cut = Date.now() - 72 * 3600 * 1000;
+  const list = (d[phone] || []).filter((x) => Date.parse(x.at) > cut);
+  list.push({ id: id || null, at: new Date().toISOString(), text: String(text).slice(0, 2500), replied: 0 });
+  d[phone] = list.slice(-15);
+  _writeStaffSends(d);
+}
+function _recentStaffSends(phone, hours) {
+  const cut = Date.now() - (hours || 24) * 3600 * 1000;
+  return (_readStaffSends()[phone] || []).filter((x) => Date.parse(x.at) > cut);
+}
+function _quotedOf(m) {
+  const msgObj = m?.message || {};
+  const inner = msgObj.ephemeralMessage?.message || msgObj;
+  for (const k of Object.keys(inner)) {
+    const ci = inner[k]?.contextInfo;
+    if (ci && (ci.stanzaId || ci.quotedMessage)) {
+      const qm = ci.quotedMessage || {};
+      const qt = qm.conversation || qm.extendedTextMessage?.text || qm.imageMessage?.caption || qm.documentMessage?.caption || '';
+      return { id: ci.stanzaId || null, text: String(qt || '') };
+    }
+  }
+  return { id: null, text: '' };
+}
+function _watTime(iso) { try { return new Date(Date.parse(iso) + 3600 * 1000).toISOString().slice(11, 16) + ' WAT'; } catch (_) { return ''; } }
+// Which recorded task message (if any) is this staff message answering? Quoting one wins; otherwise the
+// newest task sent in the last 3 hours that has not been answered yet.
+function _taskBeingAnswered(phone, quoted) {
+  const sends = _recentStaffSends(phone, 72);
+  if (quoted && quoted.id) { const hit = sends.find((x) => x.id && x.id === quoted.id); if (hit) return hit; }
+  if (quoted && quoted.text && quoted.text.length > 20) {
+    const qt = quoted.text.slice(0, 120);
+    const hit = sends.find((x) => x.text.startsWith(qt) || x.text.includes(qt));
+    if (hit) return hit;
+    return null; // quoting something else: not a task reply
+  }
+  const recent = sends.filter((x) => Date.now() - Date.parse(x.at) < 3 * 3600 * 1000 && !x.replied);
+  return recent.length ? recent[recent.length - 1] : null;
+}
+async function _forwardStaffTaskReply(u, task, body, hasMedia) {
+  const first = String(task.text).split('\n').find((l) => l.trim().length > 3 && !/^hello\b/i.test(l.trim())) || String(task.text).split('\n')[0];
+  // COO 18 Nov: space after the title, and label the reply so it reads "Mary's response: ...".
+  const _fn = String(u.name || 'Staff').split(' ')[0];
+  const fwd = `📩 *${u.name} replied to the bot*\n\nAbout the message sent at ${_watTime(task.at)}: "${first.slice(0, 160)}"\n\n*${_fn}'s response:* ${body || '(no text)'}${hasMedia ? '\n\n[They also sent a photo or file; it is in their chat with the bot.]' : ''}`;
+  const users = Object.values(_loadUsers());
+  for (const to of _STAFF_FWD_TO) {
+    if (to === u.phone) continue;
+    const r = users.find((x) => x.phone === to);
+    if (!r) continue;
+    try { await bot.sendMessage((r.jid || r.chatId || r.phone), fwd); } catch (e) { try { log.warn({ err: e?.message, to }, 'staff task reply forward failed'); } catch (_) {} }
+  }
+  const d = _readStaffSends();
+  for (const x of (d[u.phone] || [])) if (x.at === task.at) x.replied = (x.replied || 0) + 1;
+  _writeStaffSends(d);
+  try { log.info({ who: u.name, taskAt: task.at, len: (body || '').length }, 'staff-task-reply-forwarded'); } catch (_) {}
+}
+// The context block put in front of a staff member's message before it goes to Claude.
+function _staffContextBlock(msg, user) {
+  try {
+    if (!user?.phone) return '';
+    const sends = _recentStaffSends(user.phone, 24).slice(-3);
+    const q = msg._quoted || { id: null, text: '' };
+    if (!sends.length && !q.text) return '';
+    const first = String(user.name || '').split(' ')[0] || 'They';
+    const parts = ['CONTEXT FROM THE BOT (not typed by the user):'];
+    if (sends.length) {
+      parts.push(`In the last 24 hours the bot sent ${first} these messages on the COO's behalf. An automated job sent them, so they are not in your earlier conversation with ${first}, but ${first} has them:`);
+      for (const x of sends) parts.push(`--- sent ${_watTime(x.at)} ---\n${x.text}`);
+      parts.push('---');
+    }
+    if (q.text) parts.push(`${first}'s message below is a reply to this quoted message:\n«${q.text.slice(0, 1500)}»`);
+    if (msg._forwarded) parts.push(`${first}'s reply has already been forwarded to the COO and the CEO.`);
+    parts.push(`Treat ${first}'s message as a reply in that conversation. Never say you have no context or ask what it refers to when the messages above explain it. If ${first} reports what they did (for example that an order was delivered by hand or refunded), thank them, restate the outcome in one short line naming the order, and say the COO has been told. If they ask a question about those messages, answer it from them. Do not change anything in the database because of their report.`);
+    parts.push(`\n${first}'s message:`);
+    return parts.join('\n');
+  } catch (_) { return ''; }
+}
+
+const _AUDIT_MARY_PHONES = new Set(['2348031234976', '2349046707717']);
+const _AUDIT_FORWARD_TO = ['2347031095864', '2348168867154'];
+async function _auditMaryReply(m, u, text, jid) {
+  if (!u || !_AUDIT_MARY_PHONES.has(String(u.phone || ''))) return false;
+  let data;
+  try { data = JSON.parse(fs.readFileSync(_AUDIT_CHECKS, 'utf8')); } catch (_) { return false; }
+  const now = Date.now();
+  const open = Object.entries(data || {})
+    .filter(([, v]) => v && v.sentAt && now - Date.parse(v.sentAt) < 72 * 3600 * 1000)
+    .sort((a, b) => Date.parse(b[1].sentAt) - Date.parse(a[1].sentAt));
+  if (!open.length) return false;
+  const ctx = m.message?.extendedTextMessage?.contextInfo || m.message?.imageMessage?.contextInfo || m.message?.documentMessage?.contextInfo || {};
+  const quoted = ctx.quotedMessage?.conversation || ctx.quotedMessage?.extendedTextMessage?.text || '';
+  const body = String(text || '');
+  const hasMedia = !!(m.message?.imageMessage || m.message?.documentMessage || m.message?.videoMessage);
+  let hit = null;
+  for (const [day, v] of open) {
+    const shortRefs = (v.refs || []).map((r) => String(r).split('|').slice(0, 3).join('|')).filter((r) => r.startsWith('TN|'));
+    const sims = (v.sims || []).filter(Boolean);
+    const quotesIt = /Airtime audit check/i.test(quoted);
+    const namesIt = shortRefs.some((r) => body.includes(r)) || sims.some((x) => x.length > 3 && body.toLowerCase().includes(x.toLowerCase())) || /\baudit\b/i.test(body);
+    // STAFF_CONVERSATION_CONTEXT_18NOV2026: not when a newer bot message to her is what she is answering.
+    const newerTask = _recentStaffSends(String(u.phone), 72).some((x) => Date.parse(x.at) > Date.parse(v.sentAt) && !/Airtime audit check/i.test(x.text));
+    const firstReply = !newerTask && !v.replies && now - Date.parse(v.sentAt) < 24 * 3600 * 1000 && (body.trim().length > 2 || hasMedia);
+    if (quotesIt || namesIt || firstReply) { hit = [day, v]; break; }
+  }
+  if (!hit) return false;
+  const [day, v] = hit;
+  const label = new Date(day + 'T12:00:00Z').toUTCString().slice(0, 11);
+  const fwd = `📩 *Mary on the airtime audit check (${label})*\n\n${body || '(no text)'}${hasMedia ? '\n\n[She also sent a photo or file; it is in her chat with the bot.]' : ''}`;
+  const users = Object.values(_loadUsers());
+  for (const to of _AUDIT_FORWARD_TO) {
+    const r = users.find((x) => x.phone === to);
+    if (!r) continue;
+    try { await bot.sendMessage((r.jid || r.chatId || r.phone), fwd); } catch (e) { try { log.warn({ err: e?.message, to }, 'audit reply forward failed'); } catch (_) {} }
+  }
+  try { await bot.sendMessage(jid, 'Thank you, Mary. I have passed this to the COO.'); } catch (_) {}
+  try {
+    data[day] = { ...v, replies: (v.replies || 0) + 1, lastReplyAt: new Date().toISOString() };
+    fs.writeFileSync(_AUDIT_CHECKS + '.tmp', JSON.stringify(data));
+    fs.renameSync(_AUDIT_CHECKS + '.tmp', _AUDIT_CHECKS);
+  } catch (_) {}
+  try { log.info({ day, len: body.length, hasMedia }, 'audit-mary-reply-forwarded'); } catch (_) {}
+  return true;
+}
+
 async function _dispatch(m) {
   // CEO directive 9 May 2026 — inbound enabled. WhatsApp bot now mirrors
   // the Telegram bot's command parser and free-text Claude pass-through
@@ -984,6 +1326,8 @@ async function _dispatch(m) {
   // addition to @s.whatsapp.net. Multi-device WhatsApp accounts (the
   // COO and Seun) route through @lid and were silently dropped before.
   // Reject only group/broadcast/newsletter chats.
+  // BILLER_ROUTER_14NOV2026: biller groups/DMs are relayed to the HW Admin group, never parsed as staff commands.
+  try { if (await handleRouteInbound(m)) return; } catch (e) { log.error({ err: e?.message }, 'route inbound threw'); }
   if (jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
   if (!jid.endsWith('@s.whatsapp.net') && !jid.endsWith('@lid')) return;
   let phone = _phoneFromJid(jid);
@@ -1031,11 +1375,20 @@ async function _dispatch(m) {
     try { log.info({ jid, pushName: m.pushName, type: jid.endsWith('@lid') ? 'lid-unknown' : 'phone-unknown' }, 'inbound dropped — sender not on staff whitelist'); } catch (_) {}
     return;
   }
+  // EDITED_MESSAGE_AS_TEXT_09NOV2026: an edited message arrives as protocolMessage.editedMessage
+  // (Baileys 7 may wrap it in editedMessage.message). The COO's re-sent teach on 9 Nov came in
+  // this way and read as empty text. Treat the edited body as the message.
+  const _edited = m.message.protocolMessage?.editedMessage
+    || m.message.editedMessage?.message?.protocolMessage?.editedMessage
+    || null;
   const text = m.message.conversation
     || m.message.extendedTextMessage?.text
     || m.message.imageMessage?.caption
     || m.message.documentMessage?.caption
+    || _edited?.conversation
+    || _edited?.extendedTextMessage?.text
     || '';
+  if (!text) { try { log.info({ jid, keys: Object.keys(m.message || {}), protocolType: m.message.protocolMessage?.type ?? m.message.editedMessage?.message?.protocolMessage?.type ?? null }, 'textless inbound'); } catch (_) {} }
   // BOT_USAGE_LOG_10MAY2026 — log per-user usage before any handler runs
   try {
     const cmd = (text.trim().startsWith('/') ? text.trim().split(/\s+/)[0] : 'text');
@@ -1044,7 +1397,7 @@ async function _dispatch(m) {
       phone: u.phone,
       permission: u.permission,
       command: cmd,
-      text_preview: text.slice(0, 200),
+      text_preview: text.slice(0, 200) || ('[' + Object.keys(m.message || {}).join(',') + ']'), // TEACH_HALO_09NOV2026: name the message type when there is no text
       text_len: text.length,
     });
   } catch (_) {}
@@ -1082,6 +1435,19 @@ async function _dispatch(m) {
   } catch (e) {
     try { log.warn({ err: e?.message }, 'CRM quoted-reply dispatch failed'); } catch (_) {}
   }
+
+  // AUDIT_MARY_CHECK_18NOV2026: Mary's answer to the nightly airtime audit check goes to the COO
+  // and John, and she gets a thank-you. Anything else she sends still reaches the normal handler.
+  try { if (await _auditMaryReply(m, u, text, jid)) return; } catch (e) { try { log.warn({ err: e?.message }, 'audit reply relay failed'); } catch (_) {} }
+  // STAFF_CONVERSATION_CONTEXT_18NOV2026
+  const _q = _quotedOf(m);
+  let _fwd = false;
+  try {
+    if (u && u.permission !== 'full' && (text || '').trim()) {
+      const task = _taskBeingAnswered(String(u.phone), _q);
+      if (task) { await _forwardStaffTaskReply(u, task, text, !!(m.message?.imageMessage || m.message?.documentMessage)); _fwd = true; }
+    }
+  } catch (e) { try { log.warn({ err: e?.message }, 'staff task reply check failed'); } catch (_) {} }
 
   // Auto-share contact on /start: WhatsApp has no contact-share UX
   // button, so synthesise the contact event when /start arrives from
@@ -1131,6 +1497,8 @@ async function _dispatch(m) {
     contact: synth_contact,
     _phone: phone,
     _user: u,
+    _quoted: _q, // STAFF_CONVERSATION_CONTEXT_18NOV2026
+    _forwarded: _fwd,
   };
   let handled = false;
   if (text) {
@@ -1151,6 +1519,16 @@ async function _dispatch(m) {
     catch (e) { log.error({ err: e?.message }, 'message handler threw'); }
   }
 }
+
+// TEACH_HALO_09NOV2026 (COO directive 9 Nov 2026): staff file facts for Halo as drafts
+// ("teach: question | answer"); John/Bukunmi approve, fix or reject them. See teach.js.
+registerTeach({
+  bot,
+  log,
+  findSender: _findUserByTelegramId,
+  fullUsers: () => [..._BY_PHONE.values()].filter(u => u.permission === 'full'),
+  mongoUrl: _HW_MONGO_URL,
+});
 
 bot.onText(/^\/start\b/, async (msg) => {
   const tgId = msg.from?.id;
@@ -1248,11 +1626,7 @@ bot.onText(/^\/setadmin(?:\s+(.+))?$/i, async (msg, match) => {
     await bot.sendMessage(
       msg.chat.id,
       'Usage: `/setadmin <jwt>`\n\n' +
-      'Get your JWT from the dashboard:\n' +
-      '1. Log into control.honourworld.com\n' +
-      '2. Open browser dev console (F12) → Application/Storage → Local Storage → control.honourworld.com\n' +
-      '3. Copy the value of `token` (or whatever the auth key is)\n' +
-      '4. Paste it here as `/setadmin <token>`\n\n' +
+      'Ask the tech lead for the admin token. Never paste a token into a group chat.\n\n' +
       '_Then delete your /setadmin message so the JWT does not linger in chat._',
       { parse_mode: 'Markdown' }
     );
@@ -1521,7 +1895,7 @@ bot.onText(/^(?:\/fund|fund)(?:\s+(.+))?$/i, async (msg, match) => {
 // Nigerian mobile-prefix -> operator. Source: NCC numbering plan + recent
 // re-allocations through 2025. Used by /buyairtime to refuse misrouted calls
 // before they hit the biller (CEO directive 7 May 2026 — Merrybills
-// returned 'Invalid airtel phone number' on 08112594748 because 0811 is GLO,
+// returned 'invalid airtel phone number' on a 0811 number because 0811 is GLO,
 // not Airtel; bot accepted the wrong network and the purchase round-tripped
 // to a refund). Lookup is on the leading 4 digits.
 const NG_PREFIX_TO_NETWORK = (() => {
@@ -2026,6 +2400,14 @@ bot.onText(/^CONFIRM$/, async (msg) => {
 async function _processClaudePrompt(msg, prompt, user) {
   const t0 = Date.now();
   const text = prompt;
+  // OPS_STATUS_16NOV2026: "what is happening?" / "status" / "pending on the Admin" get the live
+  // status straight from the database, in about a second, whether or not the AI login works.
+  if (STATUS_RX.test(String(text || '')) && String(text || '').length <= 160 && !/TN\|/i.test(String(text)) && !/\d{10,}/.test(String(text))) {
+    const status = await _opsStatus();
+    _appendAudit(`${new Date().toISOString()} STATUS sender=${user.name}/${user.phone}`);
+    try { await bot.sendMessage(msg.chat.id, status); } catch (_) {}
+    return;
+  }
   const promptPreview = text.slice(0, 200).replace(/\n/g, ' ');
   console.log(`[hw-whatsapp-bot] /c invoking — ${user.name} (${user.permission}) — "${promptPreview}"`);
   _appendAudit(`${new Date().toISOString()} START sender=${user.name}/${user.phone} perm=${user.permission} prompt=${JSON.stringify(promptPreview)}`);
@@ -2059,8 +2441,10 @@ async function _processClaudePrompt(msg, prompt, user) {
   // <command>". The bot is the controlled boundary here — only
   // whitelisted users reach this code path, and for readonly users we
   // still gate via --disallowedTools + system prompt.
+  // STAFF_CONVERSATION_CONTEXT_18NOV2026: give Claude the bot's own messages the user is answering.
+  const _ctxBlock = _staffContextBlock(msg, user);
   const args = [
-    '-p', text,
+    '-p', _ctxBlock ? _ctxBlock + '\n' + text : text,
     '--session-id', sessionId,
     '--add-dir', '/var/www/honour_world',
     '--dangerously-skip-permissions',
@@ -2069,6 +2453,8 @@ async function _processClaudePrompt(msg, prompt, user) {
     args.push('--disallowedTools', 'Edit', 'Write', 'NotebookEdit', 'EnterWorktree');
     args.push('--append-system-prompt', READONLY_SYSTEM_PROMPT);
   }
+  // SUPERADMIN_UNRESTRICTED_09AUG2026: appended for EVERY user.
+  args.push('--append-system-prompt', _identityPrompt(user));
 
   // Spawn helper — runs `claude` once with the given args, returns
   // {stdout, stderr, exitCode, timedOut}. Used twice below: once with
@@ -2138,6 +2524,8 @@ async function _processClaudePrompt(msg, prompt, user) {
       fallback.push('--disallowedTools', 'Edit', 'Write', 'NotebookEdit', 'EnterWorktree');
       fallback.push('--append-system-prompt', READONLY_SYSTEM_PROMPT);
     }
+    // SUPERADMIN_UNRESTRICTED_09AUG2026: appended for EVERY user.
+    fallback.push('--append-system-prompt', _identityPrompt(user));
     const r2 = await _runClaude(fallback);
     stdout = r2.stdout; stderr = r2.stderr; exitCode = r2.exitCode; timedOut = r2.timedOut;
   }
@@ -2184,6 +2572,11 @@ async function _processClaudePrompt(msg, prompt, user) {
   // strip every Markdown emphasis (bold/italic/code) from Claude's
   // output. Send as plain text so even if Claude slips and emits a
   // stray asterisk or backtick, the staff never see literal markup.
+  // OPS_STATUS_16NOV2026: never show staff a raw login error; give the live status instead.
+  if (CLAUDE_AUTH_FAIL_RX.test(String(body || '')) && body.length < 600) {
+    console.error('[hw-whatsapp-bot] Claude auth failed, answering with live status:', String(body).slice(0, 160));
+    body = (await _opsStatus()) + '\n\n(My detailed answers are offline for a moment. This is the live status from the system.)';
+  }
   const reply = _safeText(_stripClaudeMarkdown(body));
   try {
     await bot.sendMessage(msg.chat.id, reply);
@@ -2256,6 +2649,9 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// BILLER_ROUTER_14NOV2026
+registerBillerRoutes({ app, getSock: () => _sock, isConnected: () => _connected, log, toJid: _toJid, waSafe: _waSafe });
 
 app.get('/healthz', (_req, res) => {
   const db = _loadUsers();
@@ -2359,7 +2755,8 @@ app.post('/send', async (req, res) => {
   const toStr = String(to).trim();
   if (toStr === 'all' || toStr === 'all-full' || toStr === 'all-readonly') {
     const filt = toStr === 'all' ? null : toStr === 'all-full' ? 'full' : 'readonly';
-    const all = Object.values(db).filter((u) => !filt || u.permission === filt);
+    // BILLER_ROUTER_14NOV2026: receive-only users (permission 'notify') get only messages addressed to them.
+    const all = Object.values(db).filter((u) => u.permission !== 'notify' && u.broadcast !== false && (!filt || u.permission === filt));
     // CEO directive 9 May 2026 — dedupe recipients by phone (or jid).
     // The user db keys some entries twice (bare phone + JID-suffixed)
     // so Object.values returned the same person twice and the loop
@@ -2423,12 +2820,14 @@ app.post('/send', async (req, res) => {
       }
       results.push({ ok: true, name: r.name, msgId: sent.message_id });
       if (ticket_number) try { _recordTicketSend(sent?.message_id, ticket_number, r.phone); } catch (_) {} // WA_CRM_REPLY_25MAY2026
+      if (recipients.length === 1 && r.phone) try { _recordStaffSend(sent?.message_id, r.phone, String(message)); } catch (_) {} // STAFF_CONVERSATION_CONTEXT_18NOV2026
     } catch (e) {
       // Markdown parse failure or photo URL fetch failure → retry plain text
       try {
         const sent = await bot.sendMessage((r.jid || r.chatId || r.phone), String(message));
         results.push({ ok: true, name: r.name, msgId: sent.message_id, plain: true });
         if (ticket_number) try { _recordTicketSend(sent?.message_id, ticket_number, r.phone); } catch (_) {} // WA_CRM_REPLY_25MAY2026
+        if (recipients.length === 1 && r.phone) try { _recordStaffSend(sent?.message_id, r.phone, String(message)); } catch (_) {} // STAFF_CONVERSATION_CONTEXT_18NOV2026
       } catch (e2) {
         results.push({ ok: false, name: r.name, error: e2?.message || 'send failed' });
       }

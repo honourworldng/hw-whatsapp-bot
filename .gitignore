@@ -10,3 +10,7 @@ last-pairing-code.*
 # editor / OS noise
 .DS_Store
 *.swp
+
+# live-box backups and runtime logs (never commit: may hold customer numbers)
+*.bak_*
+wa_outbound.jsonl
