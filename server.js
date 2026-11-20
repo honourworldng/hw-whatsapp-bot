@@ -72,6 +72,7 @@ function _opsStatus() {
 }
 import path from 'node:path';
 import { registerTeach } from './teach.js'; // TEACH_HALO_09NOV2026
+import { isAdCommentRequest, handleAdComment } from './ad_comments.js'; // AD_COMMENTS_20NOV2026
 import { registerBillerRoutes, handleRouteInbound } from './biller_routes.js'; // BILLER_ROUTER_14NOV2026
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1401,6 +1402,15 @@ async function _dispatch(m) {
       text_len: text.length,
     });
   } catch (_) {}
+
+  // AD_COMMENTS_20NOV2026 (COO 20 Nov): social post in -> 3 comment drafts out (runs in the background).
+  try {
+    if (isAdCommentRequest(u, text)) {
+      handleAdComment({ m, u, text, jid, send: (to, body) => bot.sendMessage(to, body) })
+        .catch((e) => { try { log.warn({ err: e?.message }, 'ad comment failed'); } catch (_) {} });
+      return;
+    }
+  } catch (e) { try { log.warn({ err: e?.message }, 'ad comment check failed'); } catch (_) {} }
 
   // WA_CRM_REPLY_25MAY2026 quoted-reply to a CRM ticket push? Route
   // it back into the ticket via the API's /api/v2/crm/bot-reply.
