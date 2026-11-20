@@ -104,7 +104,8 @@ export function registerBillerRoutes(ctx) {
       catch (e) { log.warn({ err: e?.message, name }, 'route join (maybe already a member)'); }
       if (jid && !String(jid).endsWith('@g.us')) jid = jid + '@g.us';
       if (!jid) return res.status(502).json({ ok: false, error: 'could not resolve the group from the invite' });
-      routes[name] = { type: 'group', jid, subject, inviteCode: code, joined, setAt: new Date().toISOString() };
+      // WATCH_GROUP_20NOV2026 (COO 20 Nov): watch:true joins a group only to read and save what is posted. Never replies, never forwards.
+      routes[name] = { type: (req.body || {}).watch ? 'watch' : 'group', jid, subject, inviteCode: code, joined, setAt: new Date().toISOString() };
       _write(ROUTES, routes);
       log.info({ name, jid, subject, joined }, 'route group saved');
       return res.json({ ok: true, route: routes[name] });
@@ -387,10 +388,29 @@ export async function handleRouteInbound(m) {
   let route = null;
   for (const [name, r] of Object.entries(routes)) {
     if (name === 'admin') continue;
-    if (r.type === 'group' && r.jid === jid) { route = name; break; }
+    if ((r.type === 'group' || r.type === 'watch') && r.jid === jid) { route = name; break; }
     if (r.type === 'dm' && r.phone && (_digits(jid.split('@')[0]) === r.phone || _digits(alt.split('@')[0]) === r.phone)) { route = name; break; }
   }
   if (!route) return false;
+  if (routes[route].type === 'watch') {
+    // WATCH_GROUP_20NOV2026: save text, sender name and any picture/video, then stop. No reply, no relay.
+    try {
+      const msg = m.message || {}; const inner = msg.ephemeralMessage?.message || msg.viewOnceMessage?.message || msg;
+      const kind = Object.keys(inner).find((k) => /Message$/.test(k)) || Object.keys(inner)[0] || 'unknown';
+      const row = { at: new Date().toISOString(), ts: Number(m.messageTimestamp?.low ?? m.messageTimestamp ?? 0), id: m.key?.id, from: m.pushName || null, kind, text: _textOf(m) || null, media: null };
+      if (/^(image|video|document)Message$/.test(kind)) {
+        try {
+          const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+          const buf = await downloadMediaMessage(m, 'buffer', {});
+          const ext = kind === 'imageMessage' ? 'jpg' : kind === 'videoMessage' ? 'mp4' : 'bin';
+          const dir = DIR + '/watch_' + route; fs.mkdirSync(dir, { recursive: true });
+          const f = dir + '/' + (m.key?.id || Date.now()) + '.' + ext; fs.writeFileSync(f, buf); row.media = f;
+        } catch (e) { row.media = 'download failed: ' + String(e?.message || e).slice(0, 80); }
+      }
+      fs.appendFileSync(DIR + '/watch_' + route + '.jsonl', JSON.stringify(row) + '\n');
+    } catch (e) { try { _ctx.log.warn({ err: e?.message, route }, 'watch capture failed'); } catch (_) {} }
+    return true;
+  }
   if (_isTeamSender(m)) {
     // BILLER_CONVERSATION_AWARE_18NOV2026: remember that our team is talking in this chat, so the
     // biller's answer to them (e.g. "Yes" to "Are you active?") is not mistaken for a reply to our report.
