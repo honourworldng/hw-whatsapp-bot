@@ -160,9 +160,11 @@ function _thanks(m, what) {
 // with hard post-checks. Any failure, timeout or rule break falls back to a plain template.
 const _HWBOT = (() => { try { const st = fs.statSync(process.env.HW_WA_HWBOT_HOME || '/home/hwbot'); return { uid: st.uid, gid: st.gid, home: process.env.HW_WA_HWBOT_HOME || '/home/hwbot' }; } catch (_) { return null; } })();
 const _BANNED_REPLY_RX = /(control\.honourworld|https?:\/\/|\bteam\b[,.!]?\s*$|\b(mdollas|vtu ?plug|ringo|cash ?2 ?bill|merry ?bills|auto ?sync) team\b|\bas an ai\b|\bassistant\b|\bi am an? (bot|ai)\b|our team has been informed|\bai\b)/im;
-function _composeBillerReply({ who, text, facts }) {
+function _composeBillerReply({ who, text, facts, route }) {
   return new Promise((resolve) => {
     if (!_HWBOT) return resolve('');
+    const L = _lessons();
+    const hist = route ? _historyFor(route) : [];
     const prompt = [
       'You run order operations at Honour World, a Nigerian bills and data company. A supplier\'s staff member wrote in our support chat with them.',
       'Write the reply you would type yourself in WhatsApp. Rules:',
@@ -176,6 +178,10 @@ function _composeBillerReply({ who, text, facts }) {
       '- If they ask a question you cannot answer from the facts: say we are checking and will get back to them here shortly.',
       '- No links, no emojis except at most one 🙏, no headings, no lists, no quotation marks around the reply. Copy each order ref exactly as given.',
       '- Never use em dashes or en dashes. Use commas and full stops.',
+      '',
+      'Lessons from past chats (follow them):',
+      ...(L.lessons || []).map((x) => '- ' + x),
+      ...(hist.length ? ['', 'Recent exchanges in this chat, oldest first, with how they turned out:', ...hist.map((x) => '- ' + x)] : []),
       '',
       'Our record:',
       ...facts.map((f) => '- ' + f),
@@ -204,14 +210,118 @@ function _cleanReply(s, refs) {
   return t;
 }
 
+// ===== BILLER_LEARNING_20NOV2026 (COO 20 Nov) =====
+// Mdollas wrote "Sorted Boss" at 06:46:52 WAT; the bot read our record one second later (still
+// pending, our checker confirmed delivery at 06:48:09) and asked them to "push it through". Two fixes:
+//  1. When a supplier says it is done, the bot rechecks our record for up to 5 minutes before it
+//     answers, and never asks them to push an order they say is sorted.
+//  2. The bot learns from the chats: every exchange is logged with how it turned out 15 minutes
+//     later; phrases that turned out to mean "done" are learned per chat, and the recent exchanges
+//     plus a lessons list go into every reply it writes.
+const CONVO = DIR + '/biller_conversations.jsonl';
+const LESSONS = DIR + '/biller_lessons.json';
+const DONE_RX = /\b(sorted|done|treated|resolved|fixed|pushed|delivered|successful|success|completed|complete|gone through|went through|has gone|all good|confirmed|credited|received)\b/i;
+const FAILED_RX = /\b(reversed|reverse[sd]?|refunded|refund(ed)?|failed|cancel+ed|declined|can'?t go|cannot go|not possible)\b/i;
+function _lessons() {
+  const d = _read(LESSONS, null);
+  if (d) return d;
+  const seed = {
+    lessons: [
+      'When a supplier says "Sorted", "Sorted Boss", "Done", "Treated" or "Pushed", they have completed it. Recheck our record; never ask them to push an order they say is sorted.',
+      'Our record can lag the supplier by a minute or two while our checker confirms. Wait and recheck before saying an order is still pending.',
+      'If they say it is done and our record still says pending after rechecking, thank them and ask for the network reference so we can close it.',
+    ],
+    donePhrases: {},
+  };
+  _write(LESSONS, seed);
+  return seed;
+}
+function _norm(t) { return String(t || '').toLowerCase().replace(/[^\p{L}\p{N}' ]/gu, ' ').replace(/\s+/g, ' ').trim(); }
+function _saysDone(route, text) {
+  if (FAILED_RX.test(text)) return false;
+  if (DONE_RX.test(text)) return true;
+  const n = _norm(text);
+  const learned = ((_lessons().donePhrases || {})[route]) || [];
+  return n.length <= 40 && learned.includes(n);
+}
+function _logConvo(entry) {
+  try { fs.appendFileSync(CONVO, JSON.stringify({ at: new Date().toISOString(), ...entry }) + '\n'); } catch (_) {}
+}
+function _convoRows() {
+  try { return fs.readFileSync(CONVO, 'utf8').split('\n').filter(Boolean).slice(-400).map((l) => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean); } catch (_) { return []; }
+}
+// Fill in how each answered exchange turned out (our record 15+ minutes later) and learn from it.
+async function _learnOutcomes() {
+  try {
+    const rows = _convoRows();
+    const due = rows.filter((r) => r.kind === 'answer' && !r.outcome && Date.now() - Date.parse(r.at) > 15 * 60 * 1000 && (r.refs || []).length);
+    if (!due.length) return;
+    const st = await _orderStates(Array.from(new Set(due.flatMap((r) => r.refs))).slice(0, 20));
+    const L = _lessons();
+    L.donePhrases = L.donePhrases || {};
+    for (const r of due) {
+      r.outcome = Object.fromEntries(r.refs.map((x) => [x, (st[x] || {}).state || 'unknown']));
+      const delivered = r.refs.every((x) => ['delivered'].includes((st[x] || {}).state));
+      const wasPending = r.refs.some((x) => (r.states || {})[x] === 'pending');
+      if (delivered && wasPending && !FAILED_RX.test(r.text || '')) {
+        r.lesson = 'they-meant-done';
+        const n = _norm(r.text);
+        if (n && n.length <= 40) {
+          const list = L.donePhrases[r.route] || [];
+          if (!list.includes(n)) { list.push(n); L.donePhrases[r.route] = list.slice(-50); }
+        }
+      }
+      _logConvo({ kind: 'outcome', route: r.route, ref: r.refs, answeredAt: r.at, outcome: r.outcome, lesson: r.lesson || null });
+      r.outcomeLogged = true;
+    }
+    _write(LESSONS, L);
+    // mark answered rows so they are not processed again
+    const done = new Set(due.map((r) => r.at + '|' + r.route));
+    const all = _convoRows().map((r) => (r.kind === 'answer' && done.has(r.at + '|' + r.route)) ? { ...r, outcome: r.outcome || 'logged' } : r);
+    fs.writeFileSync(CONVO + '.tmp', all.map((r) => JSON.stringify(r)).join('\n') + '\n'); fs.renameSync(CONVO + '.tmp', CONVO);
+  } catch (e) { try { _ctx.log.warn({ err: e?.message }, 'biller learning failed'); } catch (_) {} }
+}
+function _historyFor(route) {
+  const rows = _convoRows().filter((r) => r.route === route && (r.kind === 'answer' || r.kind === 'team' || r.kind === 'outcome')).slice(-12);
+  return rows.map((r) => r.kind === 'team' ? `our team wrote: "${String(r.text || '').slice(0, 140)}"`
+    : r.kind === 'outcome' ? `outcome for ${(r.ref || []).join(', ')}: ${Object.values(r.outcome || {}).join(', ')}${r.lesson === 'they-meant-done' ? ' (they had said it was done; it was)' : ''}`
+    : `they wrote: "${String(r.text || '').slice(0, 140)}" / our record then: ${Object.values(r.states || {}).join(', ')} / we replied: "${String(r.reply || '').slice(0, 160)}"`);
+}
+
 // Reply in the biller's own chat, quoting their message: thank them and state our record for the order(s).
 // Rate limit: one answer per chat per 10 minutes, never to a reply to our own answer.
 async function _answerBiller(m, route, refs, st) {
   try {
     const s0 = _read(SENT, { byMsg: {}, byRef: {} });
     if (Date.now() - ((s0.lastAnswer || {})[route] || 0) < 10 * 60 * 1000) return;
+    // Claim the answer slot now, so a second message during the recheck wait does not answer twice.
+    s0.lastAnswer = s0.lastAnswer || {}; s0.lastAnswer[route] = Date.now(); _write(SENT, s0);
+    const theirText = _textOf(m);
+    const saysDone = _saysDone(route, theirText);
+    // BILLER_LEARNING_20NOV2026: they say it is done but we still show pending -> recheck for up to 5 min.
+    if (saysDone && refs.some((r) => (st[r] || {}).state === 'pending')) {
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 30000));
+        st = await _orderStates(refs);
+        if (!refs.some((r) => (st[r] || {}).state === 'pending')) break;
+      }
+      _ctx.log.info({ route, refs: refs.length, after: refs.map((r) => (st[r] || {}).state) }, 'route-done-recheck');
+    }
+    const who = _firstName(m);
+    const short = (r) => String(r).split('|').slice(0, 3).join('|') === r ? r : r;
+    let reply = '';
+    if (saysDone && refs.length) {
+      const pend = refs.filter((r) => (st[r] || {}).state === 'pending');
+      const ok = refs.filter((r) => ['delivered', 'refunded'].includes((st[r] || {}).state));
+      if (!pend.length && ok.length === refs.length) {
+        reply = (who ? `Thanks ${who}, confirmed.` : 'Thanks, confirmed.') + '\n\n' + refs.map((r) => `${short(r)} has gone through on our side.`).join('\n') + '\n\nWe are good on this.';
+      } else if (pend.length) {
+        reply = (who ? `Thanks ${who}.` : 'Thanks.') + '\n\n' + pend.map((r) => `${short(r)} still shows pending on our side.`).join('\n') + '\n\nPlease share the network reference so we can close it.';
+      }
+    }
     const facts = refs.length ? refs.map((r) => r + ': ' + (STATE_WORDS[(st[r] || {}).state] || 'being checked')) : ['No specific order named. Recent orders we reported to them are being checked.'];
-    let reply = _cleanReply(await _composeBillerReply({ who: _firstName(m), text: _textOf(m), facts }), refs);
+    if (saysDone) facts.push('They are saying the order is done or sorted.');
+    if (!reply) reply = _cleanReply(await _composeBillerReply({ who, text: theirText, facts, route }), refs);
     if (!reply) {
       const lines = [_thanks(m)];
       if (refs.length) {
@@ -228,7 +338,8 @@ async function _answerBiller(m, route, refs, st) {
       }
       reply = lines.join('\n');
     }
-    _ctx.log.info({ route, refs: refs.length, composed: !!reply }, 'route-answer-text');
+    _ctx.log.info({ route, refs: refs.length, composed: !!reply, saysDone }, 'route-answer-text');
+    _logConvo({ kind: 'answer', route, who, text: String(theirText || '').slice(0, 300), refs, states: Object.fromEntries(refs.map((r) => [r, (st[r] || {}).state || 'unknown'])), saysDone, reply });
     const sock = _ctx.getSock();
     const r = loadRoutes()[route];
     const jid = r.type === 'group' ? r.jid : (m.key.remoteJid);
@@ -239,6 +350,7 @@ async function _answerBiller(m, route, refs, st) {
     s2.lastAnswer[route] = Date.now();
     _write(SENT, s2);
     _ctx.log.info({ route, refs: refs.length }, 'route-answer');
+    setTimeout(() => { _learnOutcomes(); }, 16 * 60 * 1000).unref?.();
   } catch (e) { _ctx.log.error({ err: e?.message, route }, 'route answer failed'); }
 }
 
@@ -284,12 +396,14 @@ export async function handleRouteInbound(m) {
     // biller's answer to them (e.g. "Yes" to "Are you active?") is not mistaken for a reply to our report.
     try { const st0 = _read(SENT, { byMsg: {}, byRef: {} }); st0.lastTeam = st0.lastTeam || {}; st0.lastTeam[route] = Date.now(); _write(SENT, st0); } catch (_) {}
     try { _ctx.log.info({ route, participant: m.key?.participant || null, text: String(_textOf(m)).slice(0, 60) }, 'route-team-message-ignored'); } catch (_) {}
+    try { const tt = _textOf(m); if (tt) _logConvo({ kind: 'team', route, text: String(tt).slice(0, 300) }); } catch (_) {}
     return true;
   }
   try {
     // ROUTE_INBOUND_DEBUG_14NOV2026: what arrived (keys, quoted id, first words), to see why group replies were not relayed.
     try { _ctx.log.info({ route, keys: Object.keys(m.message || {}), quoted: _quotedId(m), text: String(_textOf(m)).slice(0, 80), participant: m.key?.participant || null }, 'route-inbound'); } catch (_) {}
     const text = _textOf(m);
+    _learnOutcomes();
     const s = _pruneSent(_read(SENT, { byMsg: {}, byRef: {} }));
     const q = _quotedId(m);
     let refs = [];
@@ -351,7 +465,7 @@ export async function handleRouteInbound(m) {
     } else {
       _ctx.log.info({ route, refs: refs.length }, 'route-reply-not-forwarded');
     }
-    if (isOrderRoute && !notice && text && refs.length) await _answerBiller(m, route, refs, st);
+    if (isOrderRoute && !notice && text && refs.length) _answerBiller(m, route, refs, st).catch(() => {});
   } catch (e) { _ctx.log.error({ err: e?.message, route }, 'route relay failed'); }
   return true;
 }
