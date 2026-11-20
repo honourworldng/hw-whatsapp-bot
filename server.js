@@ -72,7 +72,7 @@ function _opsStatus() {
 }
 import path from 'node:path';
 import { registerTeach } from './teach.js'; // TEACH_HALO_09NOV2026
-import { isAdCommentRequest, handleAdComment } from './ad_comments.js'; // AD_COMMENTS_20NOV2026
+import { isAdCommentRequest, handleAdComment, isElizabeth, handleElizabethChat } from './ad_comments.js'; // AD_COMMENTS_20NOV2026
 import { registerBillerRoutes, handleRouteInbound } from './biller_routes.js'; // BILLER_ROUTER_14NOV2026
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1411,6 +1411,13 @@ async function _dispatch(m) {
       return;
     }
   } catch (e) { try { log.warn({ err: e?.message }, 'ad comment check failed'); } catch (_) {} }
+  // ELIZABETH_CHAT_20NOV2026 (COO 20 Nov): Elizabeth chats with the marketing assistant; operational
+  // questions come back (false) and go to the normal handler below.
+  try {
+    if (isElizabeth(u) && !String(text || '').trim().startsWith('/') && !(m.message?.extendedTextMessage?.contextInfo?.stanzaId && _resolveTicketFromQuotedId(m.message.extendedTextMessage.contextInfo.stanzaId))) {
+      if (await handleElizabethChat({ m, u, text, jid, send: (to, body) => bot.sendMessage(to, body) })) return;
+    }
+  } catch (e) { try { log.warn({ err: e?.message }, 'elizabeth chat failed'); } catch (_) {} }
 
   // WA_CRM_REPLY_25MAY2026 quoted-reply to a CRM ticket push? Route
   // it back into the ticket via the API's /api/v2/crm/bot-reply.

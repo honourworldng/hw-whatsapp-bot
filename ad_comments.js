@@ -52,8 +52,12 @@ function lessons() {
     return rows.slice(-15).map((r) => '- ' + r.text.slice(0, 300)).join('\n');
   } catch (_) { return ''; }
 }
+const NOTES = '/var/lib/hw-whatsapp-bot/elizabeth_notes.md';
+const CHAT = '/var/lib/hw-whatsapp-bot/elizabeth_chat.jsonl';
+function notes() { try { return fs.readFileSync(NOTES, 'utf8').slice(-4000).trim(); } catch (_) { return ''; } }
+function _tail(f, n) { try { return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).slice(-n).map((l) => { try { return JSON.parse(l); } catch (_) { return null; } }).filter(Boolean); } catch (_) { return []; } }
 function clean(s) {
-  return String(s || '').replace(/[–—]/g, ',').replace(/\bNGN\s?/g, '₦').replace(/https?:\/\/\S*(admin|control)\S*/gi, '').trim();
+  return String(s || '').replace(/\*\*([^*\n]+)\*\*/g, '*$1*').replace(/^#+\s*/gm, '').replace(/[–—]/g, ',').replace(/\bNGN\s?/g, '₦').replace(/https?:\/\/\S*(admin|control)\S*/gi, '').trim();
 }
 
 // Quick check, no I/O: is this message a comment request? (Elizabeth: any social link; anyone on the
@@ -96,6 +100,7 @@ export async function handleAdComment({ m, u, text, jid, send }) {
     'Option 1: soft (no price, just relatable plus the name). Option 2: helpful with one real price. Option 3: playful.',
     'Output format, nothing else:\n1. <comment>\n\n2. <comment>\n\n3. <comment>',
     p ? 'Price list (today, from our live system):\n' + p : 'No price list today: do not quote any price.',
+    notes() ? 'What Elizabeth has told us about how she works (follow it):\n' + notes() : '',
     lessons() ? 'Examples of what Elizabeth has posted (match her style):\n' + lessons() : '',
     post ? `The post (${post.platform}${post.author ? ', by ' + post.author : ''}):\n"""${post.text.slice(0, 1500)}"""` : '',
     pasted ? 'Post text as pasted:\n"""' + pasted.slice(0, 1500) + '"""' : '',
@@ -108,3 +113,51 @@ export async function handleAdComment({ m, u, text, jid, send }) {
   await send(jid, out + (link ? '\n\nPost: ' + link : '') + '\n\nPick one, adjust if you like, and post it yourself.');
   return true;
 }
+
+// ELIZABETH_CHAT_20NOV2026 (COO 20 Nov: "let her be conversing with you on the bot"). Elizabeth's
+// ordinary messages go to a marketing assistant that remembers the chat and saves what she teaches
+// it (elizabeth_notes.md, read by the drafter). Anything about customers, orders or operations is
+// handed back to the normal staff handler (returns false).
+export function isElizabeth(u) { return !!u && u.phone === ELIZABETH; }
+export async function handleElizabethChat({ m, u, text, jid, send }) {
+  const msg = m?.message || {};
+  let imagePath = null;
+  if (msg.imageMessage) {
+    try {
+      const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+      const buf = await downloadMediaMessage(m, 'buffer', {});
+      imagePath = '/tmp/elz_' + (m.key?.id || Date.now()) + '.jpg'; fs.writeFileSync(imagePath, buf);
+    } catch (_) { imagePath = null; }
+  }
+  if (!text && !imagePath) return false;
+  const hist = _tail(CHAT, 16).map((r) => (r.who === 'bot' ? 'You: ' : 'Elizabeth: ') + String(r.text).slice(0, 700)).join('\n');
+  const drafts = _tail(LOG, 3).map((r) => `[${r.at.slice(0, 16)}] post: ${String(r.post || r.link || '').slice(0, 200)}\ndrafts you gave:\n${String(r.out || '').slice(0, 700)}`).join('\n\n');
+  const prompt = [
+    'You are the Honour World marketing assistant on WhatsApp, talking with Elizabeth Uyang, our social media marketer. She advertises Honour World (Nigerian app for cheaper data, airtime, electricity bills, cable TV, exam pins; honourworld.com; Play Store and App Store) by commenting under trending posts on Instagram, X, LinkedIn and Facebook. She posts by hand; you help her write comments, learn her style and what works, and plan her day.',
+    'How the comment tool works (tell her if she asks): send a post link and you reply with 3 options; if a link cannot be read, she sends a screenshot captioned comment, or types comment: then pastes the post text.',
+    'Talk like a friendly colleague: short, warm, plain English, line breaks between thoughts. This is WhatsApp: bold is *single asterisks*, never ** or # headings. Never use an em dash or en dash. Money is always ₦. Never invent prices, promos or results. Never name any supplier. Never share sales, profit or revenue figures. Never share links to internal systems.',
+    'If she tells you a preference, a rule, a result (what got likes, replies or customers), a page or account she targets, or anything worth remembering for future comments, save it: add one line per fact at the very end, each starting with SAVE: (short, factual). If she sends a screenshot of her own past comment, describe its style in a SAVE: line.',
+    'If her message is about customers, orders, transactions, refunds, wallets or anything operational (not marketing), reply with exactly HANDOFF and nothing else.',
+    notes() ? 'What you already know from her (saved notes):\n' + notes() : 'You have no saved notes yet.',
+    drafts ? 'Your most recent comment drafts for her (she may be reacting to these):\n' + drafts : '',
+    hist ? 'Conversation so far:\n' + hist : '',
+    imagePath ? 'She sent a picture, saved at ' + imagePath + '. Read it first.' : '',
+    'Elizabeth now says:\n<<<' + String(text || '(picture only)').slice(0, 2000) + '>>>',
+  ].filter(Boolean).join('\n\n');
+  const out = await ask(prompt, imagePath);
+  try { if (imagePath) fs.unlinkSync(imagePath); } catch (_) {}
+  if (out && /^HANDOFF\b/.test(out.trim())) return false;
+  if (!out) { await send(jid, 'Sorry, I could not answer just now. Please send it again in a minute.'); return true; }
+  const saves = out.split('\n').filter((l) => /^\s*SAVE:/i.test(l)).map((l) => l.replace(/^\s*SAVE:\s*/i, '').trim()).filter(Boolean);
+  const reply = clean(out.split('\n').filter((l) => !/^\s*SAVE:/i.test(l)).join('\n').trim());
+  if (saves.length) { try { fs.appendFileSync(NOTES, saves.map((x) => '- ' + new Date().toISOString().slice(0, 10) + ': ' + clean(x)).join('\n') + '\n'); } catch (_) {} }
+  try {
+    fs.appendFileSync(CHAT, JSON.stringify({ at: new Date().toISOString(), who: 'elizabeth', text: String(text || '(picture)').slice(0, 2000) }) + '\n');
+    fs.appendFileSync(CHAT, JSON.stringify({ at: new Date().toISOString(), who: 'bot', text: reply.slice(0, 2000), saved: saves.length }) + '\n');
+  } catch (_) {}
+  if (reply) await send(jid, reply);
+  return true;
+}
+
+// The welcome/how-to message is logged into the chat so her answers have context.
+export function logBotTurn(body) { try { fs.appendFileSync(CHAT, JSON.stringify({ at: new Date().toISOString(), who: 'bot', text: String(body).slice(0, 3000) }) + '\n'); } catch (_) {} }
