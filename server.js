@@ -2047,6 +2047,140 @@ async function _resolveDataPlan(network, text, jwt) {
   };
 }
 
+// ── RINGO_RESTOCK_20NOV2026 (COO): restock one of our own SIMs through Ringo and record it ──
+// "Buy 50K Airtel Airtime on Oluwaseun's number via Ringo API and record it"
+// Full-access staff only. The bot finds the SIM by the staff name + network, shows exactly
+// what it will buy, and spends nothing until the sender replies YES within 2 minutes.
+// The API (POST /api/v2/sim-gateway/restocks/ringo, super-admin) buys, records the load and
+// refuses a repeated request key, so one YES can never buy twice.
+const RESTOCK_WINDOW_MS = 2 * 60 * 1000;
+const _pendingRestock = new Map(); // chatId -> { op, expiresAt }
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _pendingRestock) if (now > v.expiresAt) _pendingRestock.delete(k);
+}, 30000);
+
+const _ngn = (n) => '₦' + Number(n).toLocaleString('en-NG', { maximumFractionDigits: 2 });
+const _spacePhone = (p) => String(p || '').replace(/^(\d{4})(\d{3})(\d{4})$/, '$1 $2 $3');
+const _netWord = (n) => ({ MTN: 'MTN', AIRTEL: 'Airtel', GLO: 'Glo', T2MOBILE: 'T2Mobile' }[n] || n);
+
+function _parseRestockAmount(text) {
+  const t = String(text || '').replace(/(\d),(?=\d{3})/g, '$1').replace(/[₦#]/g, ' ');
+  const m = t.match(/\b(\d+(?:\.\d+)?)\s*([kKmM])\b/) || t.match(/\b(\d{3,7})(?:\.\d+)?\b(?!\s*%)/);
+  if (!m) return null;
+  let v = parseFloat(m[1]);
+  if (m[2]) v *= m[2].toLowerCase() === 'k' ? 1000 : 1000000;
+  return Math.round(v);
+}
+
+bot.onText(/^(?=[\s\S]*\b(?:ringo|restock)\b)(?=[\s\S]*\b(?:buy|load|restock|top\s*up)\b)[\s\S]+$/i, async (msg) => {
+  if (msg.chat.type !== 'private') return;
+  const sender = _findUserByTelegramId(msg.from?.id);
+  if (!sender) return bot.sendMessage(msg.chat.id, 'You must /start first.');
+  if (sender.permission !== 'full') return bot.sendMessage(msg.chat.id, 'Only John and Bukunmi can buy airtime stock through the bot.');
+  const text = String(msg.text || '');
+  const jwt = _getAdminJwt(sender.phone);
+  if (!jwt) return bot.sendMessage(msg.chat.id, 'No admin sign-in on file for you. Run /setadmin first.');
+
+  const amount = _parseRestockAmount(text);
+  if (!amount || amount < 100) return bot.sendMessage(msg.chat.id, 'How much should I buy? Example: Buy 50K Airtel Airtime on Oluwaseun\'s number via Ringo API and record it');
+  if (amount > 500000) return bot.sendMessage(msg.chat.id, 'The most I can buy through Ringo in one order is ₦500,000. Split it into smaller orders.');
+  const netM = text.match(/\b(MTN|AIRTEL|GLO|9MOBILE|T2MOBILE|ETISALAT)\b/i);
+  let network = netM ? netM[1].toUpperCase() : null;
+  if (network === '9MOBILE' || network === 'ETISALAT') network = 'T2MOBILE';
+
+  let gateways = [];
+  try {
+    const r = await fetch(`${HW_API_BASE}/api/v2/sim-gateway`, { headers: { Authorization: jwt, 'frontend-source': 'admin' } });
+    const j = await r.json().catch(() => ({}));
+    gateways = Array.isArray(j?.data) ? j.data : [];
+  } catch (e) {
+    return bot.sendMessage(msg.chat.id, 'I could not load the SIM list. Try again in a minute.');
+  }
+  const lower = text.toLowerCase();
+  let matches = gateways.filter((g) => {
+    const name = String(g.name || '').toLowerCase().trim();
+    return name && new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:'s|s)?\\b`, 'i').test(lower);
+  });
+  if (network) matches = matches.filter((g) => String(g.network || '').toUpperCase() === network);
+  const active = matches.filter((g) => g.status === 'active');
+  if (active.length) matches = active;
+  if (!matches.length) {
+    const names = gateways
+      .filter((g) => !network || String(g.network || '').toUpperCase() === network)
+      .filter((g) => g.status === 'active')
+      .map((g) => `${g.name} (${_netWord(String(g.network).toUpperCase())})`);
+    return bot.sendMessage(msg.chat.id, `Whose SIM should I load? I know these${network ? ` ${_netWord(network)}` : ''} lines: ${names.join(', ') || 'none'}.`);
+  }
+  if (matches.length > 1) {
+    return bot.sendMessage(msg.chat.id, `That name matches more than one SIM: ${matches.map((g) => `${g.name} ${_netWord(String(g.network).toUpperCase())}`).join(', ')}. Say the network too, e.g. Buy 50K Airtel airtime on ${matches[0].name}'s number via Ringo.`);
+  }
+  const gw = matches[0];
+  const gwNet = String(gw.network || '').toUpperCase();
+  if (!['MTN', 'AIRTEL', 'GLO', 'T2MOBILE'].includes(gwNet)) return bot.sendMessage(msg.chat.id, `${gw.name}'s line is ${gwNet}, which Ringo does not sell.`);
+  if (network && network !== gwNet) return bot.sendMessage(msg.chat.id, `${gw.name}'s line is ${_netWord(gwNet)}, not ${_netWord(network)}.`);
+  const phone = String(gw.phone || '');
+
+  const requestKey = `wa-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  _pendingRestock.set(msg.chat.id, {
+    expiresAt: Date.now() + RESTOCK_WINDOW_MS,
+    op: { gatewayId: gw._id, gatewayName: gw.name, network: gwNet, phone, amount, requestKey },
+    sender,
+  });
+  _appendAudit(`${new Date().toISOString()} RESTOCK_PROPOSED sender=${sender.name}/${sender.phone} gw=${gw.name}/${gwNet} amount=${amount} key=${requestKey}`);
+  return bot.sendMessage(
+    msg.chat.id,
+    `Buy ${_ngn(amount)} ${_netWord(gwNet)} airtime from Ringo for ${gw.name}'s line${phone ? ` ${_spacePhone(phone)}` : ''} and record it in the airtime ledger?\n\n` +
+    `Ringo takes it from our Ringo wallet straight away and it cannot be reversed once it lands.\n\n` +
+    `Reply YES within 2 minutes to buy. Anything else cancels.`,
+  );
+});
+
+// YES only counts while a restock is waiting for this chat; otherwise the message goes on
+// to the normal handlers as before.
+bot.onText({ [Symbol.match]: (s) => (_pendingRestock.size && /^\s*yes\s*[.!]?\s*$/i.test(String(s || '')) ? [s] : null) }, async (msg) => {
+  const p = _pendingRestock.get(msg.chat.id);
+  if (!p || Date.now() > p.expiresAt) {
+    _pendingRestock.delete(msg.chat.id);
+    if (_msgHandler) return _msgHandler(msg);
+    return;
+  }
+  _pendingRestock.delete(msg.chat.id);
+  const { op, sender } = p;
+  const jwt = _getAdminJwt(sender.phone);
+  if (!jwt) return bot.sendMessage(msg.chat.id, 'No admin sign-in on file for you. Run /setadmin first.');
+  await bot.sendMessage(msg.chat.id, `Buying ${_ngn(op.amount)} ${_netWord(op.network)} airtime for ${op.gatewayName}'s line now...`);
+  let status = 0;
+  let j = {};
+  try {
+    const r = await fetch(`${HW_API_BASE}/api/v2/sim-gateway/restocks/ringo`, {
+      method: 'POST',
+      headers: { Authorization: jwt, 'frontend-source': 'admin', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ gatewayId: op.gatewayId, faceAmount: op.amount, requestKey: op.requestKey, channel: 'WhatsApp bot' }),
+    });
+    status = r.status;
+    j = await r.json().catch(() => ({}));
+  } catch (e) {
+    _appendAudit(`${new Date().toISOString()} RESTOCK_UNREACHABLE sender=${sender.name} key=${op.requestKey} err=${e.message}`);
+    return bot.sendMessage(msg.chat.id, 'I could not reach our server, so I do not know if Ringo got the order. Do not order again yet: check the Ringo dashboard first.');
+  }
+  const d = j?.data || {};
+  _appendAudit(`${new Date().toISOString()} RESTOCK_RESULT sender=${sender.name} key=${op.requestKey} http=${status} status=${d.status || ''} ref=${d.ringoRef || ''}`);
+  if (status === 201 && d.status === 'delivered') {
+    const lines = [
+      `Done. ${_ngn(op.amount)} ${_netWord(op.network)} airtime sent to ${op.gatewayName}'s line ${_spacePhone(d.phone || op.phone)}.`,
+      `Ringo ref: ${d.ringoRef || '-'}`,
+      d.charged != null ? `Ringo charged ${_ngn(d.charged)} (${d.rate}%)` : (d.rate != null ? `Recorded at ${d.rate}% (current ${_netWord(op.network)} rate)` : ''),
+      d.restockId ? 'Recorded in the airtime ledger.' : 'Not recorded: there is no rate on file. Record it in Inventory.',
+      d.ringoBalanceAfter != null ? `Ringo balance now ${_ngn(d.ringoBalanceAfter)}` : '',
+    ].filter(Boolean);
+    return bot.sendMessage(msg.chat.id, lines.join('\n'));
+  }
+  if (j?.duplicate) return bot.sendMessage(msg.chat.id, `That order was already handled (${d.status || 'see Ringo'}). I did not buy again.`);
+  if (status === 202) return bot.sendMessage(msg.chat.id, `Ringo has not confirmed it yet. Do not order again: check the Ringo dashboard first.${d.ringoRequestId ? `\nOur reference: ${d.ringoRequestId}` : ''}`);
+  return bot.sendMessage(msg.chat.id, `Not bought. ${j?.msg || 'The server refused the order.'}`);
+});
+
 // ── /buyairtime <network> <phone> <amount> — propose an airtime purchase ────
 bot.onText(/^(?:\/buyairtime|(?:buy|send|airtime)\b.*?\bairtime\b|airtime\b.*)(?:\s+(.+))?$/i, async (msg, match) => {
   if (msg.chat.type !== 'private') return;
