@@ -4,7 +4,7 @@
 import fs from 'fs';
 import { execFile } from 'node:child_process';
 
-const LINK_RX = /https?:\/\/(?:www\.|m\.|vm\.|vt\.|web\.)?(instagram\.com|tiktok\.com|x\.com|twitter\.com|facebook\.com|fb\.watch|threads\.net|threads\.com|youtube\.com|youtu\.be)\/\S+/i;
+const LINK_RX = /https?:\/\/(?:www\.|m\.|vm\.|vt\.|web\.)?(instagram\.com|tiktok\.com|x\.com|twitter\.com|facebook\.com|fb\.watch|threads\.net|threads\.com|youtube\.com|youtu\.be|linkedin\.com|lnkd\.in)\/\S+/i;
 const PREFIX_RX = /^\s*\/?comments?\b[:\s-]*/i;
 const ELIZABETH = '2347025492523';
 const LOG = '/var/lib/hw-whatsapp-bot/ad_comments.jsonl';
@@ -26,7 +26,7 @@ async function postText(url) {
   if (h) {
     const og = (p) => (h.match(new RegExp('<meta[^>]+property=["\']og:' + p + '["\'][^>]+content=["\']([^"\']*)', 'i')) || [])[1];
     const text = _strip(og('description') || og('title') || '');
-    if (text && !/^(instagram|facebook|log in|threads)$/i.test(text)) return { platform: /instagram/.test(host) ? 'Instagram' : /threads/.test(host) ? 'Threads' : 'Facebook', text, author: _strip(og('title') || '') };
+    if (text && !/^(instagram|facebook|log in|threads|linkedin|sign up)$/i.test(text)) return { platform: /instagram/.test(host) ? 'Instagram' : /threads/.test(host) ? 'Threads' : /linkedin|lnkd/.test(host) ? 'LinkedIn' : 'Facebook', text, author: _strip(og('title') || '') };
   }
   return null;
 }
@@ -91,6 +91,8 @@ export async function handleAdComment({ m, u, text, jid, send }) {
     'A staff member (Elizabeth) will post your comment herself, by hand, under the trending post below. Write exactly 3 different options.',
     'Each comment must: react to what the post is actually about first, in a natural Nigerian voice (light pidgin is fine when the post is casual), then bring in Honour World only where it fits the topic. 1 to 3 short sentences. At most 2 emoji. No hashtags unless the platform is TikTok or Instagram (max 1).',
     'Rules you must never break: never use an em dash or en dash; write money as ₦ (never NGN or N); only quote a price from the price list below, exactly, and only if it fits; never invent a promo, discount, bonus or deadline; never say "cheapest in Nigeria" or similar; never name any supplier; never attack another brand; never reply to sad news (death, tragedy, violence) with an ad: if the post is about that, reply with only: SKIP and one line why.',
+    'Match the platform: on LinkedIn write in clear professional English (no pidgin, no slang, at most 1 emoji, speak as a Nigerian business that helps people and small businesses manage everyday payments); on X keep it short and witty; on Instagram and Facebook warm and friendly.',
+    (pasted && /linkedin/i.test(text || '')) ? 'This post is from LinkedIn.' : '',
     'Option 1: soft (no price, just relatable plus the name). Option 2: helpful with one real price. Option 3: playful.',
     'Output format, nothing else:\n1. <comment>\n\n2. <comment>\n\n3. <comment>',
     p ? 'Price list (today, from our live system):\n' + p : 'No price list today: do not quote any price.',
