@@ -444,9 +444,18 @@ export async function handleRouteInbound(m) {
     //  - our team spoke in this chat after our last report, within the hour -> it answers our team;
     //  - it is a bare acknowledgement ("yes", "ok", "noted", a thumbs up) -> nothing to act on.
     if (!quotedOurs && !named.length) {
+      // BILLER_NOTICE_NEGATION_21NOV2026 (COO 21 Nov): Mdollas quoted the COO, then wrote "Not is Failing"
+      // (nothing is failing) and "Ai kept telling us data is failing", and the bot answered as if
+      // "the service is down". Once a biller is in a conversation (quoting someone, or answering our team),
+      // their next unquoted lines for 15 min belong to that conversation, not to a new notice.
+      const convoAt = (s.lastConvo || {})[route] || 0;
       const why = q ? 'quotes-another-message'
         : (((s.lastTeam || {})[route] || 0) > lastOurs && Date.now() - ((s.lastTeam || {})[route] || 0) < 60 * 60 * 1000) ? 'answers-our-team'
+        : (Date.now() - convoAt < 15 * 60 * 1000) ? 'mid-conversation'
         : (BARE_ACK_RX.test(String(text || '')) && !_hasMedia(m)) ? 'bare-acknowledgement' : null;
+      if (why && why !== 'bare-acknowledgement') {
+        try { const st1 = _read(SENT, { byMsg: {}, byRef: {} }); st1.lastConvo = st1.lastConvo || {}; st1.lastConvo[route] = Date.now(); _write(SENT, st1); } catch (_) {}
+      }
       if (why) { try { _ctx.log.info({ route, why, text: String(text || '').slice(0, 60) }, 'route-reply-not-for-us'); } catch (_) {} return true; }
     }
     const isOrderRoute = ORDER_ROUTES.includes(route);
@@ -521,6 +530,10 @@ function _detect(text, list) { for (const [k, rx] of list) if (rx.test(text)) re
 export function _classifyNotice(text) {
   const t = String(text || '').trim();
   if (!t || t.length < 6) return null;
+  // BILLER_NOTICE_NEGATION_21NOV2026: a line about our AI/bot is a complaint about us, never a service
+  // notice; and "not / nothing / no ... failing / down / issue" says the opposite of an outage.
+  if (/\b(ai|a\.i\.?|bot|robot|automated|your (system|message|messages|alert|alerts))\b/i.test(t)) return null;
+  if (/\b(not|nothing|no|none|never|nobody|isn'?t|aren'?t|wasn'?t|weren'?t)\b(?:\s+\w+){0,3}?\s+(fail\w*|down|issues?|problems?|outage|glitch\w*|wrong)\b/i.test(t)) return null;
   const network = _detect(t, NET_RX);
   let service = _detect(t, SVC_RX);
   if (['AEDC', 'IKEDC', 'EKEDC', 'IBEDC', 'PHED', 'EEDC', 'KEDCO', 'JED', 'BEDC', 'KAEDCO', 'YEDC', 'ABA POWER'].includes(network)) service = 'electricity';
@@ -532,6 +545,8 @@ export function _classifyNotice(text) {
   else if (PRICE_RX.test(t) && (network || service)) kind = 'price';
   else if (BROADCAST_RX.test(t) || t.length >= 140) kind = 'info';
   if (!kind) return null;
+  // A short line that names no network, no service and reads like no announcement is chat, not a notice.
+  if (t.length < 40 && !network && !service && !BROADCAST_RX.test(t)) return null;
   return { kind, network, service };
 }
 function _svcLabel(network, service) {
