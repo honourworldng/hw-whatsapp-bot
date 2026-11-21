@@ -169,7 +169,10 @@ function _composeBillerReply({ who, text, facts, route }) {
     const prompt = [
       'You run order operations at Honour World, a Nigerian bills and data company. A supplier\'s staff member wrote in our support chat with them.',
       'Write the reply you would type yourself in WhatsApp. Rules:',
-      '- 1 to 3 short lines. Plain, warm, sharp, professional Nigerian business English. Sound like a real person, never like an AI or a bot.',
+      '- Plain, warm, sharp, professional Nigerian business English. Sound like a real person, never like an AI or a bot.',
+      // BILLER_REPLY_SPACING_21NOV2026 (COO 21 Nov: "Always space your message, let it be simple, orderly and professional.")
+      '- Layout, always spaced with a blank line between parts: (1) the thanks line alone; (2) one short sentence on where things stand; when there are 2 or more order refs, end that sentence with a colon and put each ref on its own line with nothing else on the line; (3) the ask in one short sentence, with the 🙏 at its end if you use one.',
+      '- Example for several pending orders:\nThanks, Ringopro.\n\nThese orders still show as pending on our side:\nTN|A|796|20261121151607PM944_FNKLA\nTN|A|652|20261121115539AM105_U475S\n\nKindly push them through, or reverse any that cannot go through. 🙏',
       '- Start with "Thank you' + (who ? ', ' + who : '') + '." or "Thanks' + (who ? ' ' + who : '') + '." Never write "Team" after a company name, never greet a company.',
       '- Use ONLY the facts below. Never invent a status, an amount or a promise. Never mention refunds to customers, internal staff, systems, retries or attempt counts.',
       '- If our record says delivered or refunded: confirm we are good on it, nothing more needed.',
@@ -205,7 +208,7 @@ function _composeBillerReply({ who, text, facts, route }) {
 function _cleanReply(s, refs) {
   let t = String(s || '').trim().replace(/^["'`]+|["'`]+$/g, '').replace(/\n{3,}/g, '\n\n');
   t = t.replace(/\s*[\u2014\u2013]\s*/g, ', ').replace(/, ([a-z])/g, ', $1'); // house rule: no em/en dashes
-  if (!t || t.length > 600 || t.split('\n').length > 6) return '';
+  if (!t || t.length > 900 || t.split('\n').length > 14) return ''; // BILLER_REPLY_SPACING_21NOV2026: one ref per line needs more lines
   if (_BANNED_REPLY_RX.test(t)) return '';
   if (/\bTN\|[A-Z]\|\d+/.test(t) && !refs.some((r) => t.includes(String(r).split('|').slice(0, 3).join('|')))) return '';
   return t;
