@@ -695,6 +695,22 @@ export function registerChannelRoutes(app) {
       res.json({ ok: true, jid, out });
     } catch (e) { res.status(500).json({ ok: false, error: String(e?.message || e).slice(0, 300) }); }
   });
+  // CHANNEL_MANUAL_POST_24NOV2026 (COO): post a COO-approved text to the Channel. Localhost only
+  // (server listens on 127.0.0.1). Same hard rule as _channelText: refuses any biller/provider name.
+  // Posts even in preview mode, because a person approved this exact text.
+  app.post('/channel/post', async (req, res) => {
+    try {
+      const text = String((req.body || {}).text || '').trim();
+      if (!text) return res.status(400).json({ ok: false, error: 'text required' });
+      if (BILLER_NAME_RX.test(text) || /[\u2013\u2014]/.test(text) || /\bNGN\b/.test(text)) return res.status(400).json({ ok: false, error: 'refused: biller name, dash or NGN' });
+      const sock = _ctx.getSock();
+      const jid = await _channelJid(sock);
+      if (!jid) return res.status(500).json({ ok: false, error: 'channel jid unknown' });
+      const out = await sock.sendMessage(jid, { text });
+      _ctx.log.info({ len: text.length }, 'channel-manual-post');
+      res.json({ ok: true, jid, id: out?.key?.id || null });
+    } catch (e) { res.status(500).json({ ok: false, error: String(e?.message || e).slice(0, 300) }); }
+  });
   // Dry run: what a notice would produce (reply to the biller + Channel text). Sends nothing.
   app.post('/channel/dry', (req, res) => {
     const { text, route } = req.body || {};
