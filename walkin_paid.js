@@ -11,12 +11,29 @@ import { execFile } from 'node:child_process';
 
 const DIR = '/var/lib/hw-whatsapp-bot';
 const PAID_RE = /\bpaid\s+(HW-W-\d{6})\b/i;
+// WALKIN_NATURAL_CONFIRM_26NOV2026 (COO): John replied "Payment received" to the alert and the
+// bot said nothing. A reply to a walk-in alert, or any message naming the order, that says the
+// money is in counts as the confirmation.
+const REF_RE = /\bHW-W-\d{6}\b/i;
+const CONFIRM_RE = /\b(paid|payment\s+(?:received|confirmed|seen|in)|received|confirmed?|landed|it'?s\s+in|money\s+(?:is\s+)?in|seen\s+it|deliver(?:\s+it)?)\b/i;
+const NOT_RE = /\b(not|no|haven'?t|hasn'?t|didn'?t|isn'?t|yet\s+to|wrong|short|less)\b/i;
 const TEAM_PHONES = ['2348168867154', '2347031095864', '2348167993903', '2348031230718', '2348031234976', '2347025492523', '2349045047820'];
 const _inflight = new Set();
 
 const _read = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (_) { return d; } };
 const _id = (x) => String(x || '').split('@')[0].split(':')[0];
 const _text = (m) => String(m.message?.conversation || m.message?.extendedTextMessage?.text || '').trim();
+const _ctxInfo = (m) => m.message?.extendedTextMessage?.contextInfo || m.message?.imageMessage?.contextInfo || null;
+const _quotedText = (m) => {
+  const q = _ctxInfo(m)?.quotedMessage || {};
+  return String(q.conversation || q.extendedTextMessage?.text || q.imageMessage?.caption || '').trim();
+};
+function _quotesBot(m, sock) {
+  const p = _id(_ctxInfo(m)?.participant);
+  if (!p) return false;
+  const me = [sock?.user?.id, sock?.user?.lid].filter(Boolean).map(_id);
+  return me.includes(p);
+}
 const _spaced = (p) => String(p || '').replace(/^(\d{4})(\d{3})(\d{4})$/, '$1 $2 $3');
 
 function _teamMember(m) {
@@ -67,17 +84,39 @@ function _reply(ref, res) {
 export async function handleWalkinPaid(m, sock, adminGroupJid, log) {
   if (!m?.message || m.key?.fromMe) return false;
   const text = _text(m);
-  const hit = text.match(PAID_RE);
-  if (!hit) return false;
   const jid = String(m.key?.remoteJid || '');
   const isGroup = jid.endsWith('@g.us');
   if (isGroup && jid !== adminGroupJid) return false; // only the HW Admin group, never a biller group
+  const quoted = _quotedText(m);
+  let ref = (text.match(PAID_RE) || [])[1] || null;
+  if (!ref) {
+    const named = (text.match(REF_RE) || quoted.match(REF_RE) || [])[0];
+    if (named && CONFIRM_RE.test(text) && !NOT_RE.test(text)) ref = named;
+  }
+  if (!ref) {
+    // REPLY_TO_BOT_26NOV2026 (COO): "Let the bot be responding to all its chats that we
+    // respond to." A teammate replying to one of the bot's own messages in the Admin group
+    // gets an answer instead of silence. DMs keep their own command and question handling.
+    if (isGroup && text && _quotesBot(m, sock)) {
+      const who = _teamMember(m);
+      if (who) {
+        const first = String(who.name).split(' ')[0];
+        const named = quoted.match(REF_RE);
+        const msg = named && NOT_RE.test(text)
+          ? `Thank you, ${first}. I will not deliver ${named[0].toUpperCase()} until the money is in. Reply "paid ${named[0].toUpperCase()}" once it lands.`
+          : `Thank you, ${first}. Noted.`;
+        await sock.sendMessage(jid, { text: msg }, { quoted: m }).catch(() => {});
+        return true;
+      }
+    }
+    return false;
+  }
   const who = _teamMember(m);
   if (!who) {
     if (!isGroup) await sock.sendMessage(jid, { text: 'Only the Honour World team can confirm walk-in payments.' }).catch(() => {});
     return true;
   }
-  const ref = hit[1].toUpperCase();
+  ref = String(ref).toUpperCase();
   if (_inflight.has(ref)) { await sock.sendMessage(jid, { text: `${ref} is already being delivered.` }).catch(() => {}); return true; }
   _inflight.add(ref);
   try {
