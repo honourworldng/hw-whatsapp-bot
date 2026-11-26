@@ -73,7 +73,8 @@ function _opsStatus() {
 import path from 'node:path';
 import { registerTeach } from './teach.js'; // TEACH_HALO_09NOV2026
 import { isAdCommentRequest, handleAdComment, isElizabeth, handleElizabethChat } from './ad_comments.js'; // AD_COMMENTS_20NOV2026
-import { registerBillerRoutes, handleRouteInbound } from './biller_routes.js'; // BILLER_ROUTER_14NOV2026
+import { registerBillerRoutes, handleRouteInbound, loadRoutes as _loadRoutesForWalkin } from './biller_routes.js'; // BILLER_ROUTER_14NOV2026
+import { handleWalkinPaid } from './walkin_paid.js'; // WALKIN_AUTO_DELIVER_26NOV2026
 
 // ─────────────────────────────────────────────────────────────────────────
 // BOT_USAGE_LOG_10MAY2026 — per-user usage logger (COO directive 10 May 2026).
@@ -1328,6 +1329,8 @@ async function _dispatch(m) {
   // COO and Seun) route through @lid and were silently dropped before.
   // Reject only group/broadcast/newsletter chats.
   // BILLER_ROUTER_14NOV2026: biller groups/DMs are relayed to the HW Admin group, never parsed as staff commands.
+  // WALKIN_AUTO_DELIVER_26NOV2026: "paid HW-W-123456" from the team in the Admin group or a DM.
+  try { if (await handleWalkinPaid(m, _sock, _loadRoutesForWalkin()?.admin?.jid, log)) return; } catch (e) { log.error({ err: e?.message }, 'walkin paid threw'); }
   try { if (await handleRouteInbound(m)) return; } catch (e) { log.error({ err: e?.message }, 'route inbound threw'); }
   if (jid.endsWith('@g.us') || jid.endsWith('@broadcast') || jid.endsWith('@newsletter')) return;
   if (!jid.endsWith('@s.whatsapp.net') && !jid.endsWith('@lid')) return;
