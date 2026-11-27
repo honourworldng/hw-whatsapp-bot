@@ -143,6 +143,59 @@ function _orderStates(refs) {
   });
 }
 
+// RESENT_FOLLOWUP_27NOV2026 (COO 27 Nov 2026): the COO told a supplier "08149532907 - 2GB not
+// received today" with their own reply ("Transaction in progress..."); their staff answered that
+// they had resent it, and the bot said nothing. When a supplier says it resent or re-pushed an order
+// our team raised, the bot now asks why it did not go through the first time, quoting what their
+// system first told us, so it does not happen again.
+const RESENT_RX = /\b(re-?sen[dt]\w*|re-?pushe?d?|pushed (it )?again|sent (it )?again|re-?process\w*|re-?vend\w*|re-?submit\w*|re-?tr(y|ied)\w*|re-?initiat\w*|re-?trigger\w*)\b/i;
+const PHONE_RX = /(?:\+?234|0)[789][01]\d{8}/g;
+function _phonesIn(text) { return Array.from(new Set((String(text || '').replace(/[\s-]/g, '').match(PHONE_RX) || []).map((p) => (p.startsWith('+234') ? '0' + p.slice(4) : p.startsWith('234') ? '0' + p.slice(3) : p)))).slice(0, 3); }
+function _ordersByPhone(phones) {
+  return new Promise((resolve) => {
+    if (!phones.length) return resolve({});
+    execFile('python3', ['/var/www/honour_world/order_status.py', '--phone', ...phones], { timeout: 20000 }, (err, out) => {
+      try { resolve(err ? {} : JSON.parse(String(out || '{}'))); } catch (_) { resolve({}); }
+    });
+  });
+}
+const _spaced = (p) => String(p || '').replace(/^(\d{4})(\d{3})(\d{4})$/, '$1 $2 $3');
+async function _askWhyResent(m, route, ask) {
+  try {
+    const s0 = _read(SENT, { byMsg: {}, byRef: {} });
+    s0.lastWhy = s0.lastWhy || {};
+    const key = route + '|' + (ask.phones || []).concat(ask.refs || []).join(',');
+    if (Date.now() - (s0.lastWhy[key] || 0) < 6 * 3600 * 1000) return; // once per raised order per 6 h
+    s0.lastWhy[key] = Date.now(); _write(SENT, s0);
+    const items = [];
+    const byPhone = await _ordersByPhone(ask.phones || []);
+    for (const [ph, o] of Object.entries(byPhone)) if (o && o.ref) items.push({ ref: o.ref, phone: ph, code: o.first_code, said: o.first_said });
+    for (const r of (ask.refs || [])) if (!items.some((x) => x.ref === r)) items.push({ ref: r });
+    const who = _firstName(m);
+    const lines = [(who ? `Thanks ${who}` : 'Thanks') + ', noted that it has been resent.'];
+    const it = items[0];
+    if (it) {
+      const what = it.phone ? `the order for ${_spaced(it.phone)} (${String(it.ref).split('|').slice(0, 3).join('|')})` : String(it.ref).split('|').slice(0, 3).join('|');
+      const showed = it.code === 200 ? 'showed it as successful' : (it.said ? `answered "${String(it.said).replace(/["“”]/g, '').slice(0, 100)}"` : 'did not complete it');
+      lines.push('', `Please, why did ${what} not go through the first time? Your system ${showed}, but the customer did not receive it.`);
+    } else {
+      lines.push('', 'Please, why did it not go through the first time? Your system showed it as done, but the customer did not receive it.');
+    }
+    lines.push('', 'We want to understand what happened so it does not repeat. 🙏');
+    const reply = _noCode(lines.join('\n')).replace(/\s*[—–]\s*/g, ', ');
+    const sock = _ctx.getSock();
+    const r = loadRoutes()[route];
+    const jid = r.type === 'group' ? r.jid : m.key.remoteJid;
+    const sent = await sock.sendMessage(jid, { text: _ctx.waSafe(reply) }, { quoted: m });
+    const s2 = _read(SENT, { byMsg: {}, byRef: {} });
+    s2.acks = s2.acks || {};
+    if (sent?.key?.id) s2.acks[sent.key.id] = new Date().toISOString();
+    _write(SENT, s2);
+    _logConvo({ kind: 'answer', route, who, text: String(_textOf(m) || '').slice(0, 300), refs: items.map((x) => x.ref), states: {}, saysDone: false, reply, why: 'resent-followup' });
+    _ctx.log.info({ route, items: items.length }, 'route-resent-followup');
+  } catch (e) { try { _ctx.log.error({ err: e?.message, route }, 'resent follow-up failed'); } catch (_) {} }
+}
+
 const STATE_WORDS = { delivered: 'delivered on our side', pending: 'still pending on our side', refunded: 'refunded to the customer on our side', failed: 'failed on our side', unknown: 'not found on our side' };
 
 // BILLER_HUMAN_REPLY_18NOV2026 (COO 18 Nov): never "Thank you, Mdollas Team" / "Hello Ringo Team".
@@ -417,7 +470,13 @@ export async function handleRouteInbound(m) {
   if (_isTeamSender(m)) {
     // BILLER_CONVERSATION_AWARE_18NOV2026: remember that our team is talking in this chat, so the
     // biller's answer to them (e.g. "Yes" to "Are you active?") is not mistaken for a reply to our report.
-    try { const st0 = _read(SENT, { byMsg: {}, byRef: {} }); st0.lastTeam = st0.lastTeam || {}; st0.lastTeam[route] = Date.now(); _write(SENT, st0); } catch (_) {}
+    try {
+      const st0 = _read(SENT, { byMsg: {}, byRef: {} }); st0.lastTeam = st0.lastTeam || {}; st0.lastTeam[route] = Date.now();
+      // RESENT_FOLLOWUP_27NOV2026: remember the order(s) our team raised here (phone numbers or refs).
+      const tt0 = _textOf(m); const ph0 = _phonesIn(tt0); const rf0 = _refsIn(tt0);
+      if (ph0.length || rf0.length) { st0.teamAsk = st0.teamAsk || {}; st0.teamAsk[route] = { at: Date.now(), msgId: m.key?.id || null, phones: ph0, refs: rf0 }; }
+      _write(SENT, st0);
+    } catch (_) {}
     try { _ctx.log.info({ route, participant: m.key?.participant || null, text: String(_textOf(m)).slice(0, 60) }, 'route-team-message-ignored'); } catch (_) {}
     try { const tt = _textOf(m); if (tt) _logConvo({ kind: 'team', route, text: String(tt).slice(0, 300) }); } catch (_) {}
     return true;
@@ -458,6 +517,12 @@ export async function handleRouteInbound(m) {
         : (BARE_ACK_RX.test(String(text || '')) && !_hasMedia(m)) ? 'bare-acknowledgement' : null;
       if (why && why !== 'bare-acknowledgement') {
         try { const st1 = _read(SENT, { byMsg: {}, byRef: {} }); st1.lastConvo = st1.lastConvo || {}; st1.lastConvo[route] = Date.now(); _write(SENT, st1); } catch (_) {}
+      }
+      // RESENT_FOLLOWUP_27NOV2026: they are answering an order our team raised and say they resent it.
+      const ask = (s.teamAsk || {})[route];
+      if (why && why !== 'bare-acknowledgement' && ask && RESENT_RX.test(String(text || '')) && Date.now() - ask.at < 6 * 3600 * 1000 && (!q || q === ask.msgId || why !== 'quotes-another-message')) {
+        _askWhyResent(m, route, ask).catch(() => {});
+        return true;
       }
       if (why) { try { _ctx.log.info({ route, why, text: String(text || '').slice(0, 60) }, 'route-reply-not-for-us'); } catch (_) {} return true; }
     }
