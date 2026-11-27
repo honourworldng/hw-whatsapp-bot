@@ -7,6 +7,10 @@ import { execFile } from 'node:child_process';
 const LINK_RX = /https?:\/\/(?:www\.|m\.|vm\.|vt\.|web\.)?(instagram\.com|tiktok\.com|x\.com|twitter\.com|facebook\.com|fb\.watch|threads\.net|threads\.com|youtube\.com|youtu\.be|linkedin\.com|lnkd\.in)\/\S+/i;
 const PREFIX_RX = /^\s*\/?comments?\b[:\s-]*/i;
 const ELIZABETH = '2347025492523';
+// COVER_ELIZABETH_27NOV2026 (COO 27 Nov): Omogoriola covers Elizabeth's content work until she is back.
+// To hand it back, remove Omogoriola's number from this list.
+const CONTENT_PHONES = new Set([ELIZABETH, '2349045047820']);
+const _first = (u) => String(u?.name || 'Elizabeth').split(' ')[0];
 const LOG = '/var/lib/hw-whatsapp-bot/ad_comments.jsonl';
 const UA = 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)';
 
@@ -65,7 +69,7 @@ function clean(s) {
 export function isAdCommentRequest(u, text) {
   if (!u || !text) return false;
   if (PREFIX_RX.test(text)) return true;
-  return u.phone === ELIZABETH && LINK_RX.test(text);
+  return CONTENT_PHONES.has(u.phone) && LINK_RX.test(text);
 }
 
 export async function handleAdComment({ m, u, text, jid, send }) {
@@ -92,7 +96,7 @@ export async function handleAdComment({ m, u, text, jid, send }) {
   const p = await prices();
   const prompt = [
     'You write short social media comments for Honour World, a Nigerian app for cheaper data, airtime, electricity bills, cable TV (DStv, GOtv, StarTimes) and exam pins (WAEC). Website honourworld.com; app "Honour World" on Play Store and App Store.',
-    'A staff member (Elizabeth) will post your comment herself, by hand, under the trending post below. Write exactly 3 different options.',
+    'A staff member will post your comment themselves, by hand, under the trending post below. Write exactly 3 different options.',
     'Each comment must: react to what the post is actually about first, in a natural Nigerian voice (light pidgin is fine when the post is casual), then bring in Honour World only where it fits the topic. 1 to 3 short sentences. At most 2 emoji. No hashtags unless the platform is TikTok or Instagram (max 1).',
     'Rules you must never break: never use an em dash or en dash; write money as ₦ (never NGN or N); only quote a price from the price list below, exactly, and only if it fits; never invent a promo, discount, bonus or deadline; never say "cheapest in Nigeria" or similar; never name any supplier; never attack another brand; never reply to sad news (death, tragedy, violence) with an ad: if the post is about that, reply with only: SKIP and one line why.',
     'Match the platform: on LinkedIn write in clear professional English (no pidgin, no slang, at most 1 emoji, speak as a Nigerian business that helps people and small businesses manage everyday payments); on X keep it short and witty; on Instagram and Facebook warm and friendly.',
@@ -118,7 +122,7 @@ export async function handleAdComment({ m, u, text, jid, send }) {
 // ordinary messages go to a marketing assistant that remembers the chat and saves what she teaches
 // it (elizabeth_notes.md, read by the drafter). Anything about customers, orders or operations is
 // handed back to the normal staff handler (returns false).
-export function isElizabeth(u) { return !!u && u.phone === ELIZABETH; }
+export function isElizabeth(u) { return !!u && CONTENT_PHONES.has(u.phone); }
 export async function handleElizabethChat({ m, u, text, jid, send }) {
   const msg = m?.message || {};
   let imagePath = null;
@@ -130,10 +134,10 @@ export async function handleElizabethChat({ m, u, text, jid, send }) {
     } catch (_) { imagePath = null; }
   }
   if (!text && !imagePath) return false;
-  const hist = _tail(CHAT, 16).map((r) => (r.who === 'bot' ? 'You: ' : 'Elizabeth: ') + String(r.text).slice(0, 700)).join('\n');
+  const hist = _tail(CHAT, 16).map((r) => (r.who === 'bot' ? 'You: ' : 'Staff: ') + String(r.text).slice(0, 700)).join('\n');
   const drafts = _tail(LOG, 3).map((r) => `[${r.at.slice(0, 16)}] post: ${String(r.post || r.link || '').slice(0, 200)}\ndrafts you gave:\n${String(r.out || '').slice(0, 700)}`).join('\n\n');
   const prompt = [
-    'You are the Honour World marketing assistant on WhatsApp, talking with Elizabeth Uyang, our social media marketer. She advertises Honour World (Nigerian app for cheaper data, airtime, electricity bills, cable TV, exam pins; honourworld.com; Play Store and App Store) by commenting under trending posts on Instagram, X, LinkedIn and Facebook. She posts by hand; you help her write comments, learn her style and what works, and plan her day.',
+    'You are the Honour World marketing assistant on WhatsApp, talking with ' + String(u?.name || 'Elizabeth Uyang') + ', who runs our social media. They advertise Honour World (Nigerian app for cheaper data, airtime, electricity bills, cable TV, exam pins; honourworld.com; Play Store and App Store) by commenting under trending posts on Instagram, X, LinkedIn and Facebook. They post by hand; you help them write comments, learn their style and what works, and plan their day.',
     'How the comment tool works (tell her if she asks): send a post link and you reply with 3 options; if a link cannot be read, she sends a screenshot captioned comment, or types comment: then pastes the post text.',
     'Talk like a friendly colleague: short, warm, plain English, line breaks between thoughts. This is WhatsApp: bold is *single asterisks*, never ** or # headings. Never use an em dash or en dash. Money is always ₦. Never invent prices, promos or results. Never name any supplier. Never share sales, profit or revenue figures. Never share links to internal systems.',
     'If she tells you a preference, a rule, a result (what got likes, replies or customers), a page or account she targets, or anything worth remembering for future comments, save it: add one line per fact at the very end, each starting with SAVE: (short, factual). If she sends a screenshot of her own past comment, describe its style in a SAVE: line.',
@@ -142,7 +146,7 @@ export async function handleElizabethChat({ m, u, text, jid, send }) {
     drafts ? 'Your most recent comment drafts for her (she may be reacting to these):\n' + drafts : '',
     hist ? 'Conversation so far:\n' + hist : '',
     imagePath ? 'She sent a picture, saved at ' + imagePath + '. Read it first.' : '',
-    'Elizabeth now says:\n<<<' + String(text || '(picture only)').slice(0, 2000) + '>>>',
+    _first(u) + ' now says:\n<<<' + String(text || '(picture only)').slice(0, 2000) + '>>>',
   ].filter(Boolean).join('\n\n');
   const out = await ask(prompt, imagePath);
   try { if (imagePath) fs.unlinkSync(imagePath); } catch (_) {}
