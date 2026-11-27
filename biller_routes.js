@@ -518,6 +518,10 @@ export async function handleRouteInbound(m) {
       if (why && why !== 'bare-acknowledgement') {
         try { const st1 = _read(SENT, { byMsg: {}, byRef: {} }); st1.lastConvo = st1.lastConvo || {}; st1.lastConvo[route] = Date.now(); _write(SENT, st1); } catch (_) {}
       }
+      // STOCK_OUT_NOTICE_27NOV2026: a stock-out is answered even inside a conversation (only this kind;
+      // other notice words mid-conversation stay ignored, see BILLER_NOTICE_NEGATION_21NOV2026).
+      const nkS = (why && why !== 'bare-acknowledgement' && ORDER_ROUTES.includes(route)) ? _classifyNotice(text) : null;
+      if (nkS && nkS.kind === 'stock') { await _handleNotice(m, route, text, nkS); return true; }
       // RESENT_FOLLOWUP_27NOV2026: they are answering an order our team raised and say they resent it.
       const ask = (s.teamAsk || {})[route];
       if (why && why !== 'bare-acknowledgement' && ask && RESENT_RX.test(String(text || '')) && Date.now() - ask.at < 6 * 3600 * 1000 && (!q || q === ask.msgId || why !== 'quotes-another-message')) {
@@ -595,6 +599,7 @@ const PRICE_RX = /\b(price|pricing|rates?|new plans?|plan codes?|discontinu\w*|i
 const BROADCAST_RX = /\b(dear (customer|partner|all|esteemed)|please be informed|kindly note|please note|notice|announcement|be advised|attention|important)\b/i;
 
 function _detect(text, list) { for (const [k, rx] of list) if (rx.test(text)) return k; return ''; }
+const STOCK_RX = /\b(out of stock|no (more )?stock|stock (is |has )?(finished|exhausted|out|done)|exhausted (most of |all )?(our )?(the )?stock|ran out of|run out of|not in stock|sold out|out of (the )?(3|5|1|2|10)?\s*(gb|mb))\b/i;
 export function _classifyNotice(text) {
   const t = String(text || '').trim();
   if (!t || t.length < 6) return null;
@@ -606,6 +611,12 @@ export function _classifyNotice(text) {
   let service = _detect(t, SVC_RX);
   if (['AEDC', 'IKEDC', 'EKEDC', 'IBEDC', 'PHED', 'EEDC', 'KEDCO', 'JED', 'BEDC', 'KAEDCO', 'YEDC', 'ABA POWER'].includes(network)) service = 'electricity';
   if (['DSTV', 'GOTV', 'STARTIMES'].includes(network)) service = 'cable';
+  // STOCK_OUT_NOTICE_27NOV2026 (COO 27 Nov): Mdollas wrote "We're out of stock for 3gb" and the bot said
+  // nothing. A stock-out is a supply notice even when it is short and names no network.
+  if (STOCK_RX.test(t) && !/\b(back in stock|restocked|now in stock|stock (is )?(back|available))\b/i.test(t)) {
+    const sz = t.match(/(\d+(?:\.\d+)?)\s*(gb|mb|g)\b/i);
+    return { kind: 'stock', network, service, size: sz ? sz[1] + (/^m/i.test(sz[2]) ? 'MB' : 'GB') : '' };
+  }
   let kind = '';
   if (RESTORED_RX.test(t) && !/\bnot (yet )?(back|restored|resolved|fixed)\b/i.test(t)) kind = 'restored';
   else if (DOWN_RX.test(t) && !/\b(was|were) down\b/i.test(t)) kind = 'down';
@@ -635,6 +646,10 @@ function _noticeReply(route, nk, m) {
     case 'restored': return [upd, '', 'Noted that ' + (known ? what : 'the service') + ' is back.'].join('\n');
     case 'delay': return [upd, '', 'Noted about the delay' + (known ? ' on ' + what : '') + '. Please let us know here once it is back to normal.'].join('\n');
     case 'price': return [upd, '', 'Noted. We will review the change on our side.'].join('\n');
+    case 'stock': {
+      const item = [nk.size, known ? what : ''].filter(Boolean).join(' ');
+      return [upd, '', 'Noted that ' + (item ? 'the ' + item : 'it') + ' is out of stock for now.', '', 'Please let us know here as soon as it is back in stock. 🙏'].join('\n');
+    }
     default: return [note, '', 'Noted.'].join('\n');
   }
 }
@@ -703,6 +718,8 @@ async function _handleNotice(m, route, text, nk) {
         nk.network ? what + ' orders may be slower than usual right now. They are still being processed.' : null);
     } else if (nk.kind === 'price') {
       _feed('price_change', route + ' announced a price change on ' + what + ': ' + said, nk.network, nk.service, null);
+    } else if (nk.kind === 'stock') {
+      _feed('biller_stock', route + ' is out of stock' + (nk.size ? ' for ' + nk.size : '') + (nk.network || nk.service ? ' (' + what + ')' : '') + ': ' + said, nk.network, nk.service, null);
     } else if (nk.kind === 'info') {
       _feed('biller_notice', route + ' notice: ' + said, nk.network, nk.service, null);
     }
