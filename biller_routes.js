@@ -796,12 +796,24 @@ export function registerChannelRoutes(app) {
         const full = path.resolve(dir, path.basename(video));
         if (!full.startsWith(dir) || !fs.existsSync(full) || !/\.mp4$/i.test(full)) return res.status(400).json({ ok: false, error: 'video must be an .mp4 in channel_media' });
         content = { video: fs.readFileSync(full), mimetype: 'video/mp4', caption: text || undefined };
+        // CHANNEL_VIDEO_META_28NOV2026 (COO): for a Channel, Baileys uploads the raw file and skips the
+        // thumbnail, length and size it normally works out, and WhatsApp then hides the post from
+        // followers (the 28 Nov 07:00 post was accepted but never showed). Send them ourselves: a
+        // <name>.jpg next to the video becomes the preview picture, and seconds/width/height come
+        // from the request (the server has no ffmpeg to measure them).
+        const b = req.body || {};
+        const num = (v) => { const n = Math.round(Number(v)); return Number.isFinite(n) && n > 0 ? n : undefined; };
+        if (num(b.seconds)) content.seconds = num(b.seconds);
+        if (num(b.width)) content.width = num(b.width);
+        if (num(b.height)) content.height = num(b.height);
+        const thumb = full.replace(/\.mp4$/i, '.jpg');
+        if (fs.existsSync(thumb)) content.jpegThumbnail = fs.readFileSync(thumb);
       }
       const sock = _ctx.getSock();
       const jid = previewTo ? _ctx.toJid(previewTo) : await _channelJid(sock);
       if (!jid) return res.status(500).json({ ok: false, error: 'channel jid unknown' });
       const out = await sock.sendMessage(jid, content);
-      _ctx.log.info({ len: text.length, video: video || null, preview: !!previewTo }, 'channel-manual-post');
+      _ctx.log.info({ len: text.length, video: video || null, preview: !!previewTo, seconds: content.seconds, thumb: !!content.jpegThumbnail }, 'channel-manual-post');
       res.json({ ok: true, jid, id: out?.key?.id || null });
     } catch (e) { res.status(500).json({ ok: false, error: String(e?.message || e).slice(0, 300) }); }
   });
