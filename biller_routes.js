@@ -6,6 +6,8 @@
 import fs from 'fs';
 import { execFile } from 'node:child_process';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { proto, generateMessageID } from '@whiskeysockets/baileys';
 
 const DIR = process.env.HW_WA_ROUTE_DIR || '/var/lib/hw-whatsapp-bot';
 const ROUTES = DIR + '/routes.json';
@@ -758,6 +760,40 @@ async function _handleNotice(m, route, text, nk) {
     }
   }
 }
+// CHANNEL_VIDEO_UPLOAD_28NOV2026 (COO): Baileys rc14 posts Channel media the wrong way: it uploads to
+// the normal chat media path, drops the upload handle, and leaves the media type off the message. WhatsApp
+// accepts the send but followers never see it (28 Nov 07:00 and 07:45 posts). This sends a Channel video
+// the way WhatsApp's own apps do: unencrypted upload to the newsletter path, then a "media" message that
+// carries the upload handle (media_id) and mediatype. Returns WhatsApp's acknowledgement so we can tell
+// a real post from a silent drop.
+async function _postChannelVideo(sock, jid, { buf, caption, seconds, width, height, thumb }) {
+  const sha = createHash('sha256').update(buf).digest();
+  const token = sha.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  let conn = await sock.refreshMediaConn(false);
+  let up = null; let lastErr = '';
+  for (let attempt = 0; attempt < 2 && !up; attempt++) {
+    for (const { hostname } of conn.hosts) {
+      try {
+        const url = `https://${hostname}/newsletter/newsletter-video/${token}?auth=${encodeURIComponent(conn.auth)}&token=${token}`;
+        const r = await fetch(url, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream', Origin: 'https://web.whatsapp.com' }, signal: AbortSignal.timeout(180000) });
+        const j = await r.json().catch(() => ({}));
+        if (j.url || j.direct_path) { up = j; break; }
+        lastErr = JSON.stringify(j).slice(0, 200);
+      } catch (e) { lastErr = String(e?.message || e).slice(0, 200); }
+    }
+    if (!up) conn = await sock.refreshMediaConn(true);
+  }
+  if (!up) throw new Error('channel video upload failed: ' + lastErr);
+  const msg = proto.Message.fromObject({ videoMessage: {
+    url: up.url, directPath: up.direct_path, fileSha256: sha, fileLength: buf.length, mimetype: 'video/mp4',
+    caption: caption || undefined, seconds, width, height, jpegThumbnail: thumb || undefined,
+  } });
+  const id = generateMessageID();
+  const attrs = { to: jid, id, type: 'media' };
+  if (up.handle) attrs.media_id = up.handle;
+  const ack = await sock.query({ tag: 'message', attrs, content: [{ tag: 'plaintext', attrs: { mediatype: 'video' }, content: proto.Message.encode(msg).finish() }] }, 60000);
+  return { id, handle: !!up.handle, ack: ack?.attrs || null, ackError: (ack?.content || []).find?.((c) => c?.tag === 'error')?.attrs || null };
+}
 export function registerChannelRoutes(app) {
   // Read-only: resolve the Channel and show our role. Also saves the jid.
   app.get('/channel/info', async (_req, res) => {
@@ -812,6 +848,11 @@ export function registerChannelRoutes(app) {
       const sock = _ctx.getSock();
       const jid = previewTo ? _ctx.toJid(previewTo) : await _channelJid(sock);
       if (!jid) return res.status(500).json({ ok: false, error: 'channel jid unknown' });
+      if (video && !previewTo) {
+        const r = await _postChannelVideo(sock, jid, { buf: content.video, caption: content.caption, seconds: content.seconds, width: content.width, height: content.height, thumb: content.jpegThumbnail });
+        _ctx.log.info({ len: text.length, video, preview: false, seconds: content.seconds, thumb: !!content.jpegThumbnail, upload: 'newsletter', ...r }, 'channel-manual-post');
+        return res.json({ ok: !r.ackError, jid, ...r });
+      }
       const out = await sock.sendMessage(jid, content);
       _ctx.log.info({ len: text.length, video: video || null, preview: !!previewTo, seconds: content.seconds, thumb: !!content.jpegThumbnail }, 'channel-manual-post');
       res.json({ ok: true, jid, id: out?.key?.id || null });
