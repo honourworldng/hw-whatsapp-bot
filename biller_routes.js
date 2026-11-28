@@ -132,6 +132,24 @@ export function registerBillerRoutes(ctx) {
       return res.json({ ok: true, message_id: id });
     } catch (e) { return res.status(500).json({ ok: false, error: String(e?.message || e).slice(0, 200) }); }
   });
+
+  // ROUTE_EDIT_28NOV2026 (COO 28 Nov: "Just edit it, don't post a new one"): edit a message the bot
+  // already sent in a biller chat, in place. WhatsApp allows edits for about 15 minutes after sending.
+  app.post('/route/edit', async (req, res) => {
+    try {
+      const { route, message_id, message } = req.body || {};
+      if (!route || !message_id || !message) return res.status(400).json({ ok: false, error: 'route, message_id and message required' });
+      const r = loadRoutes()[route];
+      if (!r) return res.status(404).json({ ok: false, error: 'unknown route' });
+      const sock = _ctx.getSock();
+      if (!sock || !_ctx.isConnected()) return res.status(503).json({ ok: false, error: 'WhatsApp socket not connected' });
+      const jid = r.type === 'group' ? r.jid : _ctx.toJid(_digits(r.phone));
+      const key = { remoteJid: jid, fromMe: true, id: String(message_id) };
+      await sock.sendMessage(jid, { text: _ctx.waSafe(_noCode(String(message))), edit: key });
+      log.info({ route, id: message_id }, 'route-edit');
+      return res.json({ ok: true, message_id });
+    } catch (e) { return res.status(500).json({ ok: false, error: String(e?.message || e).slice(0, 200) }); }
+  });
 }
 
 // Called first in _dispatch. Returns true when the message came from a biller route (handled
