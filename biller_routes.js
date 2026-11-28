@@ -784,7 +784,11 @@ async function _handleNotice(m, route, text, nk) {
 // the way WhatsApp's own apps do: unencrypted upload to the newsletter path, then a "media" message that
 // carries the upload handle (media_id) and mediatype. Returns WhatsApp's acknowledgement so we can tell
 // a real post from a silent drop.
-async function _postChannelVideo(sock, jid, { buf, caption, seconds, width, height, thumb }) {
+// CHANNEL_IMAGE_UPLOAD_28NOV2026 (COO): images get the same treatment as videos. `kind` is 'video' or
+// 'image'. With dryUpload, the file is uploaded and nothing is posted (to test the upload safely).
+// A post counts as published only when WhatsApp's ack carries a server_id.
+async function _postChannelMedia(sock, jid, kind, { buf, mimetype, caption, seconds, width, height, thumb, dryUpload }) {
+  if (kind !== 'video' && kind !== 'image') throw new Error('unsupported channel media: ' + kind);
   const sha = createHash('sha256').update(buf).digest();
   const token = sha.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   let conn = await sock.refreshMediaConn(false);
@@ -792,7 +796,7 @@ async function _postChannelVideo(sock, jid, { buf, caption, seconds, width, heig
   for (let attempt = 0; attempt < 2 && !up; attempt++) {
     for (const { hostname } of conn.hosts) {
       try {
-        const url = `https://${hostname}/newsletter/newsletter-video/${token}?auth=${encodeURIComponent(conn.auth)}&token=${token}`;
+        const url = `https://${hostname}/newsletter/newsletter-${kind}/${token}?auth=${encodeURIComponent(conn.auth)}&token=${token}`;
         const r = await fetch(url, { method: 'POST', body: buf, headers: { 'Content-Type': 'application/octet-stream', Origin: 'https://web.whatsapp.com' }, signal: AbortSignal.timeout(180000) });
         const j = await r.json().catch(() => ({}));
         if (j.url || j.direct_path) { up = j; break; }
@@ -801,16 +805,20 @@ async function _postChannelVideo(sock, jid, { buf, caption, seconds, width, heig
     }
     if (!up) conn = await sock.refreshMediaConn(true);
   }
-  if (!up) throw new Error('channel video upload failed: ' + lastErr);
-  const msg = proto.Message.fromObject({ videoMessage: {
-    url: up.url, directPath: up.direct_path, fileSha256: sha, fileLength: buf.length, mimetype: 'video/mp4',
-    caption: caption || undefined, seconds, width, height, jpegThumbnail: thumb || undefined,
-  } });
+  if (!up) throw new Error(`channel ${kind} upload failed: ` + lastErr);
+  if (dryUpload) return { dryUpload: true, uploaded: true, handle: !!up.handle, directPath: !!up.direct_path };
+  const media = {
+    url: up.url, directPath: up.direct_path, fileSha256: sha, fileLength: buf.length, mimetype,
+    caption: caption || undefined, width, height, jpegThumbnail: thumb || undefined,
+  };
+  if (kind === 'video') media.seconds = seconds;
+  const msg = proto.Message.fromObject({ [`${kind}Message`]: media });
   const id = generateMessageID();
   const attrs = { to: jid, id, type: 'media' };
   if (up.handle) attrs.media_id = up.handle;
-  const ack = await sock.query({ tag: 'message', attrs, content: [{ tag: 'plaintext', attrs: { mediatype: 'video' }, content: proto.Message.encode(msg).finish() }] }, 60000);
-  return { id, handle: !!up.handle, ack: ack?.attrs || null, ackError: (ack?.content || []).find?.((c) => c?.tag === 'error')?.attrs || null };
+  const ack = await sock.query({ tag: 'message', attrs, content: [{ tag: 'plaintext', attrs: { mediatype: kind }, content: proto.Message.encode(msg).finish() }] }, 60000);
+  const ackError = (ack?.content || []).find?.((c) => c?.tag === 'error')?.attrs || (ack?.attrs?.error ? { error: ack.attrs.error } : null);
+  return { id, handle: !!up.handle, serverId: ack?.attrs?.server_id || null, ack: ack?.attrs || null, ackError };
 }
 export function registerChannelRoutes(app) {
   // Read-only: resolve the Channel and show our role. Also saves the jid.
@@ -841,8 +849,12 @@ export function registerChannelRoutes(app) {
       // CHANNEL_VIDEO_POST_28NOV2026 (COO): optional video, with the text as its caption. Only files
       // placed in the channel_media folder can be posted. `to` (a phone) sends a preview DM instead.
       const video = String((req.body || {}).video || '').trim();
+      // CHANNEL_IMAGE_UPLOAD_28NOV2026: optional image (.jpg/.jpeg/.png in channel_media), text as caption.
+      const image = String((req.body || {}).image || '').trim();
+      const dryUpload = (req.body || {}).dryUpload === true;
       const previewTo = String((req.body || {}).to || '').replace(/\D/g, '');
-      if (!text && !video) return res.status(400).json({ ok: false, error: 'text or video required' });
+      if (!text && !video && !image) return res.status(400).json({ ok: false, error: 'text, video or image required' });
+      if (video && image) return res.status(400).json({ ok: false, error: 'send either a video or an image, not both' });
       if (BILLER_NAME_RX.test(text) || /[\u2013\u2014]/.test(text) || /\bNGN\b/.test(text)) return res.status(400).json({ ok: false, error: 'refused: biller name, dash or NGN' });
       let content = { text };
       if (video) {
@@ -863,16 +875,30 @@ export function registerChannelRoutes(app) {
         const thumb = full.replace(/\.mp4$/i, '.jpg');
         if (fs.existsSync(thumb)) content.jpegThumbnail = fs.readFileSync(thumb);
       }
+      if (image) {
+        const dir = '/var/lib/hw-whatsapp-bot/channel_media/';
+        const full = path.resolve(dir, path.basename(image));
+        if (!full.startsWith(dir) || !fs.existsSync(full) || !/\.(jpe?g|png)$/i.test(full)) return res.status(400).json({ ok: false, error: 'image must be a .jpg or .png in channel_media' });
+        content = { image: fs.readFileSync(full), mimetype: /\.png$/i.test(full) ? 'image/png' : 'image/jpeg', caption: text || undefined };
+        const b = req.body || {};
+        const num = (v) => { const n = Math.round(Number(v)); return Number.isFinite(n) && n > 0 ? n : undefined; };
+        if (num(b.width)) content.width = num(b.width);
+        if (num(b.height)) content.height = num(b.height);
+        // A small <name>.thumb.jpg next to the image becomes its preview picture.
+        const thumb = full.replace(/\.(jpe?g|png)$/i, '.thumb.jpg');
+        if (fs.existsSync(thumb)) content.jpegThumbnail = fs.readFileSync(thumb);
+      }
       const sock = _ctx.getSock();
       const jid = previewTo ? _ctx.toJid(previewTo) : await _channelJid(sock);
       if (!jid) return res.status(500).json({ ok: false, error: 'channel jid unknown' });
-      if (video && !previewTo) {
-        const r = await _postChannelVideo(sock, jid, { buf: content.video, caption: content.caption, seconds: content.seconds, width: content.width, height: content.height, thumb: content.jpegThumbnail });
-        _ctx.log.info({ len: text.length, video, preview: false, seconds: content.seconds, thumb: !!content.jpegThumbnail, upload: 'newsletter', ...r }, 'channel-manual-post');
-        return res.json({ ok: !r.ackError, jid, ...r });
+      if ((video || image) && !previewTo) {
+        const kind = video ? 'video' : 'image';
+        const r = await _postChannelMedia(sock, jid, kind, { buf: content[kind], mimetype: content.mimetype, caption: content.caption, seconds: content.seconds, width: content.width, height: content.height, thumb: content.jpegThumbnail, dryUpload });
+        _ctx.log.info({ len: text.length, [kind]: video || image, preview: false, seconds: content.seconds, thumb: !!content.jpegThumbnail, upload: 'newsletter', ...r }, 'channel-manual-post');
+        return res.json({ ok: r.dryUpload ? true : (!!r.serverId && !r.ackError), jid, ...r });
       }
       const out = await sock.sendMessage(jid, content);
-      _ctx.log.info({ len: text.length, video: video || null, preview: !!previewTo, seconds: content.seconds, thumb: !!content.jpegThumbnail }, 'channel-manual-post');
+      _ctx.log.info({ len: text.length, video: video || null, image: image || null, preview: !!previewTo, seconds: content.seconds, thumb: !!content.jpegThumbnail }, 'channel-manual-post');
       res.json({ ok: true, jid, id: out?.key?.id || null });
     } catch (e) { res.status(500).json({ ok: false, error: String(e?.message || e).slice(0, 300) }); }
   });
