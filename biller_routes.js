@@ -5,6 +5,7 @@
 // refunds, resends or marks anything: it only carries messages.
 import fs from 'fs';
 import { execFile } from 'node:child_process';
+import path from 'node:path';
 
 const DIR = process.env.HW_WA_ROUTE_DIR || '/var/lib/hw-whatsapp-bot';
 const ROUTES = DIR + '/routes.json';
@@ -783,13 +784,24 @@ export function registerChannelRoutes(app) {
   app.post('/channel/post', async (req, res) => {
     try {
       const text = String((req.body || {}).text || '').trim();
-      if (!text) return res.status(400).json({ ok: false, error: 'text required' });
+      // CHANNEL_VIDEO_POST_28NOV2026 (COO): optional video, with the text as its caption. Only files
+      // placed in the channel_media folder can be posted. `to` (a phone) sends a preview DM instead.
+      const video = String((req.body || {}).video || '').trim();
+      const previewTo = String((req.body || {}).to || '').replace(/\D/g, '');
+      if (!text && !video) return res.status(400).json({ ok: false, error: 'text or video required' });
       if (BILLER_NAME_RX.test(text) || /[\u2013\u2014]/.test(text) || /\bNGN\b/.test(text)) return res.status(400).json({ ok: false, error: 'refused: biller name, dash or NGN' });
+      let content = { text };
+      if (video) {
+        const dir = '/var/lib/hw-whatsapp-bot/channel_media/';
+        const full = path.resolve(dir, path.basename(video));
+        if (!full.startsWith(dir) || !fs.existsSync(full) || !/\.mp4$/i.test(full)) return res.status(400).json({ ok: false, error: 'video must be an .mp4 in channel_media' });
+        content = { video: fs.readFileSync(full), mimetype: 'video/mp4', caption: text || undefined };
+      }
       const sock = _ctx.getSock();
-      const jid = await _channelJid(sock);
+      const jid = previewTo ? _ctx.toJid(previewTo) : await _channelJid(sock);
       if (!jid) return res.status(500).json({ ok: false, error: 'channel jid unknown' });
-      const out = await sock.sendMessage(jid, { text });
-      _ctx.log.info({ len: text.length }, 'channel-manual-post');
+      const out = await sock.sendMessage(jid, content);
+      _ctx.log.info({ len: text.length, video: video || null, preview: !!previewTo }, 'channel-manual-post');
       res.json({ ok: true, jid, id: out?.key?.id || null });
     } catch (e) { res.status(500).json({ ok: false, error: String(e?.message || e).slice(0, 300) }); }
   });
