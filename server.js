@@ -2807,6 +2807,80 @@ app.use((req, res, next) => {
 // BILLER_ROUTER_14NOV2026
 registerBillerRoutes({ app, getSock: () => _sock, isConnected: () => _connected, log, toJid: _toJid, waSafe: _waSafe });
 
+// BRIEF_BOT_CHAT_28NOV2026 (COO 28 Nov 2026: "Can't the message go directly without opening my WhatsApp?").
+// The COO's Morning Brief (installed Mac app) talks to this bot through a small local connector that
+// reaches this loopback port over SSH. POST /brief/ask runs the SAME text handlers a WhatsApp DM from
+// that staff member would run; anything the handlers send to the synthetic chat "brief:<phone>" is
+// captured into an outbox instead of going to WhatsApp, and returned. Late replies stay in the outbox
+// for GET /brief/poll. Full-permission staff only (John + Bukunmi). Loopback + shared token, like /send.
+const _briefOutbox = new Map(); // phone -> [{ seq, at, text }]
+let _briefSeq = 0;
+const _briefLocks = new Map();
+const _isBriefChat = (chatId) => typeof chatId === 'string' && chatId.startsWith('brief:');
+const _briefPush = (chatId, text) => {
+  const phone = chatId.slice(6);
+  const box = _briefOutbox.get(phone) || [];
+  box.push({ seq: ++_briefSeq, at: new Date().toISOString(), text: String(text || '') });
+  while (box.length > 60) box.shift();
+  _briefOutbox.set(phone, box);
+  return { message_id: 'brief-' + _briefSeq };
+};
+{
+  const _origSend = bot.sendMessage.bind(bot);
+  const _origPhoto = bot.sendPhoto.bind(bot);
+  bot.sendMessage = async (chatId, text, opts = {}) => (_isBriefChat(chatId) ? _briefPush(chatId, text) : _origSend(chatId, text, opts));
+  bot.sendPhoto = async (chatId, image, opts = {}) => (_isBriefChat(chatId) ? _briefPush(chatId, opts?.caption ? opts.caption : '[picture]') : _origPhoto(chatId, image, opts));
+  bot.sendChatAction = async () => {};
+}
+const _briefUser = (phone) => {
+  const p = String(phone || '').replace(/\D/g, '');
+  const local = p.startsWith('234') ? '0' + p.slice(3) : p;
+  const u = _BY_PHONE.get(local) || _BY_PHONE.get(p) || null;
+  return u && u.permission === 'full' ? u : null;
+};
+app.post('/brief/ask', async (req, res) => {
+  const u = _briefUser(req.body?.phone);
+  const text = String(req.body?.text || '').trim().slice(0, 2000);
+  if (!u) return res.status(403).json({ ok: false, error: 'not a full-permission staff phone' });
+  if (!text) return res.status(400).json({ ok: false, error: 'empty text' });
+  const chatId = 'brief:' + u.phone;
+  // One message at a time per person, so replies are not mixed up.
+  const prev = _briefLocks.get(u.phone) || Promise.resolve();
+  let release; const mine = new Promise((r) => { release = r; });
+  _briefLocks.set(u.phone, prev.then(() => mine));
+  await prev;
+  const startSeq = _briefSeq;
+  try {
+    try { logUsage_BOT_USAGE_LOG_10MAY2026({ user_name: u.name, phone: u.phone, permission: u.permission, command: text.startsWith('/') ? text.split(/\s+/)[0] : 'text', text_preview: '[brief] ' + text.slice(0, 190), text_len: text.length }); } catch (_) {}
+    const msg = {
+      message_id: 'brief-in-' + Date.now(),
+      chat: { id: chatId, type: 'private' },
+      from: { id: `${u.phone}@s.whatsapp.net`, first_name: (u.name || '').split(' ')[0], last_name: (u.name || '').split(' ').slice(1).join(' ') },
+      text, contact: null, _phone: u.phone, _user: u, _quoted: null, _forwarded: false, _viaBrief: true,
+    };
+    const run = (async () => {
+      let handled = false;
+      for (const { regex, fn } of _textHandlers) {
+        const match = text.match(regex);
+        if (match) { try { await fn(msg, match); handled = true; break; } catch (e) { log.error({ err: e?.message }, 'brief onText handler threw'); } }
+      }
+      if (!handled && _msgHandler) { try { await _msgHandler(msg); } catch (e) { log.error({ err: e?.message }, 'brief message handler threw'); } }
+    })();
+    await Promise.race([run, new Promise((r) => setTimeout(r, 170000))]);
+    await new Promise((r) => setTimeout(r, 1500)); // let a trailing reply land
+    const replies = (_briefOutbox.get(u.phone) || []).filter((x) => x.seq > startSeq);
+    res.json({ ok: true, replies, lastSeq: _briefSeq });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e?.message || 'failed' });
+  } finally { release(); }
+});
+app.get('/brief/poll', (req, res) => {
+  const u = _briefUser(req.query?.phone);
+  if (!u) return res.status(403).json({ ok: false, error: 'not a full-permission staff phone' });
+  const since = Number(req.query?.since || 0);
+  res.json({ ok: true, replies: (_briefOutbox.get(u.phone) || []).filter((x) => x.seq > since), lastSeq: _briefSeq });
+});
+
 app.get('/healthz', (_req, res) => {
   const db = _loadUsers();
   res.json({
